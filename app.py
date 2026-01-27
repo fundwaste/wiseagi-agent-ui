@@ -1,6 +1,6 @@
 # app.py - WiseAGI Complete Rewrite with Cross-Agent Reasoning ✅
 import streamlit as st
-from supabase_config import supabase
+from supabase_config import supabase, secure_supabase
 from supabase import create_client
 from pymilvus import connections, Collection
 from openai import OpenAI
@@ -36,8 +36,8 @@ XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_MODEL   = os.getenv("XAI_MODEL", "grok-4-fast-reasoning")
 grok_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1") if XAI_API_KEY else None
 
-SUPABASE_URL = "https://bkxphaekghgcgfzwbnqc.supabase.co"
-SERVICE_ROLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJreHBoYWVrZ2hnY2dmendibnFjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc0NDU3NTk1OCwiZXhwIjoyMDYwMTUxOTU4fQ.AgX9_99opI-UphOJVzLXM1huPz0adXiOmI34s7YwPuQ"  
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 secure_supabase = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
 
 model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
@@ -224,6 +224,16 @@ def query_openai_context(prompt, context, purpose="default", personality=None):
             f"{'When possible, cite sources provided by the user.' if personality.get('citations', True) else ''}"
         )
 
+    ls = (personality or {}).get("learning_support")
+    if ls and "SEN" in ls:
+        sys += " Use simple language, short steps, and check understanding. Avoid jargon."
+    elif ls and "Dyslexia" in ls:
+        sys += " Use short sentences, clear structure, and avoid dense paragraphs."
+    elif ls and "ADHD" in ls:
+        sys += " Keep responses brief, bullet-pointed, and step-by-step."
+    elif ls and "EAL" in ls:
+        sys += " Use simple English, define key words, and give one example."
+
     response = openai_client.chat.completions.create(
         model=model,
         max_tokens=350,
@@ -236,8 +246,45 @@ def query_openai_context(prompt, context, purpose="default", personality=None):
     answer = response.choices[0].message.content.strip()
     completion_tokens = count_tokens(answer, model)
     total_tokens = prompt_tokens + completion_tokens
-    cost = estimate_cost(prompt_tokens, completion_tokens, model)
-    return answer, total_tokens, cost
+
+    # after you compute answer + tokens
+    usage = getattr(response, "usage", None)
+    if usage:
+        prompt_tokens = int(getattr(usage, "prompt_tokens", prompt_tokens))
+        completion_tokens = int(getattr(usage, "completion_tokens", completion_tokens))
+
+    # build meta from session/user (MVP-safe defaults)
+    meta = {
+        "company_id": user["company_id"],
+        "user_id": user["id"],
+        "bill_to_company_id": user.get("company_id"),
+        "external_user_id": None,
+        "plan_code": get_user_plan(user["id"]),
+        "agent_id": st.session_state.get("active_agent_id"),
+        "request_type": purpose,  # e.g. "peer_review" / "consensus"
+        "subject": None,
+        "year_group": None,
+        "topic": None,
+    }
+
+    log_llm_usage(
+        company_id=meta["company_id"],
+        user_id=meta["user_id"],
+        bill_to_company_id=meta["bill_to_company_id"],
+        external_user_id=meta["external_user_id"],
+        plan_code=meta["plan_code"],
+        agent_id=meta["agent_id"],
+        request_type=meta["request_type"],
+        subject=meta["subject"],
+        year_group=meta["year_group"],
+        topic=meta["topic"],
+        provider="openai",
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+    return answer, (prompt_tokens + completion_tokens), None
 
 def query_agent_context(prompt: str, context: str, personality=None):
     """
@@ -257,27 +304,57 @@ def query_agent_context(prompt: str, context: str, personality=None):
             f"{'When possible, cite sources provided by the user.' if personality.get('citations', True) else ''}"
         )
 
-    full_input = f"{prompt}\n\n{context}"
-    prompt_tokens = count_tokens(full_input, model="gpt-3.5-turbo")
+    ls = (personality or {}).get("learning_support")
+    if ls and "SEN" in ls:
+        sys += " Use simple language, short steps, and check understanding. Avoid jargon."
+    elif ls and "Dyslexia" in ls:
+        sys += " Use short sentences, clear structure, and avoid dense paragraphs."
+    elif ls and "ADHD" in ls:
+        sys += " Keep responses brief, bullet-pointed, and step-by-step."
+    elif ls and "EAL" in ls:
+        sys += " Use simple English, define key words, and give one example."
 
-    def _call(client, model):
+    full_input = f"{prompt}\n\n{context}"
+
+    def _call(client, model_name, provider_name):
         resp = client.chat.completions.create(
-            model=model,
+            model=model_name,
             max_tokens=350,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": full_input},
-            ],
+            messages=[{"role":"system","content":sys},{"role":"user","content":full_input}],
         )
         answer = resp.choices[0].message.content.strip()
-        completion_tokens = count_tokens(answer, model="gpt-3.5-turbo")
-        return answer, (prompt_tokens + completion_tokens), 0.0  # keep £0 for non-OpenAI in MVP
+
+        usage = getattr(resp, "usage", None)
+        if usage:
+            pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            ct = int(getattr(usage, "completion_tokens", 0) or 0)
+        else:
+            pt = count_tokens(full_input)
+            ct = count_tokens(answer)
+
+        log_llm_usage(
+            company_id=user["company_id"],
+            user_id=user["id"],
+            bill_to_company_id=user.get("company_id"),
+            external_user_id=None,
+            plan_code=get_user_plan(user["id"]),
+            agent_id=st.session_state.get("active_agent_id"),
+            request_type="agent_turn",
+            subject=None, year_group=None, topic=None,
+            provider=provider_name,
+            model=model_name,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+        )
+
+        return answer, (pt + ct), None
 
     try:
         if provider == "grok" and grok_client:
-            return _call(grok_client, XAI_MODEL)
+            return _call(grok_client, XAI_MODEL, "grok")
         if provider == "deepseek" and deepseek_client:
-            return _call(deepseek_client, DEEPSEEK_MODEL)
+            return _call(deepseek_client, DEEPSEEK_MODEL, "deepseek")
+
         # If provider not configured, fall back to OpenAI
         return query_openai_context(prompt, context, purpose="peer_review", personality=personality)
 
@@ -463,6 +540,142 @@ def facilitator_gate(supabase, project_id, user_id, pending_agent_ids, question)
         st.stop()
     return refined
 
+# === Model Cost Helpers ===
+
+from decimal import Decimal
+
+def get_model_cost_rate(provider: str, model: str):
+    rows = (secure_supabase.table("model_cost_rates")
+        .select("prompt_per_1k_gbp,completion_per_1k_gbp,valid_from")
+        .eq("is_active", True)
+        .eq("provider", provider)
+        .eq("model", model)
+        .order("valid_from", desc=True)
+        .limit(1)
+        .execute().data) or []
+    return rows[0] if rows else None
+
+def list_pricing_rules(company_id: str):
+    return (secure_supabase.table("pricing_rules")
+        .select("*")
+        .eq("is_active", True)
+        .or_(f"company_id.is.null,company_id.eq.{company_id}")
+        .execute().data) or []
+
+def pick_pricing_rule(rules, *, company_id, plan_code, agent_id, request_type, provider, model):
+    def match(r):
+        def ok(field, val):
+            return (r.get(field) is None) or (str(r.get(field)) == str(val))
+        # company_id can be NULL (global) or exact match
+        return (
+            (r.get("company_id") is None or str(r.get("company_id")) == str(company_id)) and
+            ok("plan_code", plan_code) and
+            ok("agent_id", agent_id) and
+            ok("request_type", request_type) and
+            ok("provider", provider) and
+            ok("model", model)
+        )
+
+    candidates = [r for r in rules if match(r)]
+    if not candidates:
+        return None
+
+    def specificity(r):
+        keys = ["company_id","plan_code","agent_id","request_type","provider","model"]
+        return sum(1 for k in keys if r.get(k) is not None)
+
+    # lowest priority number wins; if tie, more specific wins
+    candidates.sort(key=lambda r: (int(r.get("priority", 100)), -specificity(r)))
+    return candidates[0]
+
+def compute_costs_gbp(*, provider, model, prompt_tokens, completion_tokens, pricing_rule, default_markup_pct=Decimal("10")):
+    rate = get_model_cost_rate(provider, model)
+    if rate:
+        p = Decimal(str(rate["prompt_per_1k_gbp"]))
+        c = Decimal(str(rate["completion_per_1k_gbp"]))
+        provider_cost = (Decimal(prompt_tokens)/Decimal(1000))*p + (Decimal(completion_tokens)/Decimal(1000))*c
+    else:
+        provider_cost = Decimal("0")
+
+    # Sell price: either explicit sell rates OR markup over provider cost
+    if pricing_rule and pricing_rule.get("sell_prompt_per_1k_gbp") is not None and pricing_rule.get("sell_completion_per_1k_gbp") is not None:
+        sp = Decimal(str(pricing_rule["sell_prompt_per_1k_gbp"]))
+        sc = Decimal(str(pricing_rule["sell_completion_per_1k_gbp"]))
+        sell_price = (Decimal(prompt_tokens)/Decimal(1000))*sp + (Decimal(completion_tokens)/Decimal(1000))*sc
+        markup_pct = pricing_rule.get("markup_pct")  # optional
+    else:
+        markup_pct = Decimal(str((pricing_rule or {}).get("markup_pct", default_markup_pct)))
+        sell_price = provider_cost * (Decimal("1") + (markup_pct/Decimal("100")))
+
+    return float(provider_cost), float(sell_price), float(markup_pct) if markup_pct is not None else None, (pricing_rule or {}).get("id")
+
+# === One logging function that writes every call to llm_usage ===
+
+def log_llm_usage(
+    *,
+    company_id: str,
+    user_id: str,
+    bill_to_company_id: str | None,
+    external_user_id: str | None,
+    plan_code: str | None,
+    agent_id: str | None,
+    request_type: str | None,
+    subject: str | None,
+    year_group: str | None,
+    topic: str | None,
+    provider: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+):
+    bill_to = bill_to_company_id or company_id
+
+    rules = list_pricing_rules(bill_to)
+    rule = pick_pricing_rule(
+        rules,
+        company_id=bill_to,
+        plan_code=plan_code,
+        agent_id=agent_id,
+        request_type=request_type,
+        provider=provider,
+        model=model,
+    )
+
+    provider_cost_gbp, sell_price_gbp, markup_pct, pricing_rule_id = compute_costs_gbp(
+        provider=provider,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        pricing_rule=rule,
+    )
+
+    row = {
+        "company_id": company_id,
+        "user_id": user_id,
+        "bill_to_company_id": bill_to,
+        "external_user_id": external_user_id,
+        "plan_code": plan_code,
+        "agent_id": agent_id,
+        "request_type": request_type,
+        "subject": subject,
+        "year_group": year_group,
+        "topic": topic,
+        "provider": provider,
+        "model": model,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "cost_cost_gbp": provider_cost_gbp,
+        "sell_price_gbp": sell_price_gbp,
+        "pricing_rule_id": pricing_rule_id,
+        "markup_pct": markup_pct,
+
+        # Backwards compatibility if you still use these elsewhere:
+        "base_cost_gbp": provider_cost_gbp,
+        "billed_cost_gbp": sell_price_gbp,
+    }
+
+    secure_supabase.table("llm_usage").insert(row).execute()
+
 # ---------- Sprint 3: conversations helpers ----------
 from typing import List, Dict, Any
 
@@ -595,19 +808,20 @@ def load_user_personality(user_id: str, company_id: str):
         data = getattr(res, "data", None)
         if not data:
             raise ValueError("No personality row")
-        # if personality column is NULL, return default
         personality = data.get("personality") or {}
     except Exception:
         personality = {}
 
-    # defaults
     return {
         "tone": personality.get("tone", "Balanced"),
         "style": personality.get("style", "Concise"),
         "citations": personality.get("citations", True),
         "max_words": personality.get("max_words", 180),
-    }
 
+        # ✅ add these
+        "learning_support": personality.get("learning_support", "Prefer not to say"),
+        "sen_self_declared": bool(personality.get("sen_self_declared", False)),
+    }
 def save_user_personality(user_id: str, company_id: str, pers: dict):
     supabase.table("user_personalities").upsert({
         "user_id": user_id,
@@ -794,12 +1008,33 @@ _curr = load_user_personality(user["id"], user["company_id"])
 tone  = st.sidebar.selectbox("Tone", ["Balanced","Analytical","Strategic","Supportive","Challenger"],
                              index=["Balanced","Analytical","Strategic","Supportive","Challenger"].index(_curr.get("tone","Balanced")))
 style = st.sidebar.selectbox("Style", ["Concise","Detailed"], index=0 if _curr.get("style","Concise")=="Concise" else 1)
+support_options = [
+    "Prefer not to say",
+    "No additional support",
+    "Special Educational Needs (SEN) — self-declared",
+    "Dyslexia-friendly support",
+    "ADHD-friendly support",
+    "English as an Additional Language (EAL)",
+]
+
+support = st.sidebar.selectbox(
+    "Learning support (optional)",
+    support_options,
+    index=support_options.index(_curr.get("learning_support", "Prefer not to say"))
+        if _curr.get("learning_support") in support_options else 0
+)
+
 cit   = st.sidebar.checkbox("Include sources/citations", value=bool(_curr.get("citations", True)))
 mxw   = st.sidebar.slider("Max words", min_value=80, max_value=500, value=int(_curr.get("max_words", 180)), step=10)
 
 if st.sidebar.button("💾 Save personality"):
     save_user_personality(user["id"], user["company_id"], {
-        "tone": tone, "style": style, "citations": cit, "max_words": mxw
+        "tone": tone,
+        "style": style,
+        "citations": cit,
+        "max_words": mxw,
+        "learning_support": support,
+        "sen_self_declared": (support == "Special Educational Needs (SEN) — self-declared"),
     })
     st.sidebar.success("Saved.")
 
@@ -1480,11 +1715,6 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
-
-
-
-
-
 
 
 
