@@ -5,12 +5,14 @@ from supabase import create_client
 from pymilvus import connections, Collection
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import APIStatusError
 from functools import lru_cache
 import os, re, numpy as np
 import tiktoken
 import uuid
+import jwt
+from uuid import uuid4
 
 # --------- 1. Setup Connections ---------
 connections.connect(
@@ -39,6 +41,8 @@ grok_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1") if XAI
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 secure_supabase = create_client(SUPABASE_URL, SERVICE_ROLE_KEY)
+
+EMBED_SHARED_SECRET = os.getenv("EMBED_SHARED_SECRET")
 
 model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
@@ -140,6 +144,479 @@ def embed_arabic_768(text: str) -> np.ndarray:
     vec = vec[:768] if len(vec) >= 768 else vec
     return np.asarray(vec, dtype=np.float32)
 
+# --------- Guardrail helpers (DeRad gatekeeper) ---------
+
+DERAD_COLLECTION = os.getenv("DERAD_COLLECTION", "derad")
+GUARDRAIL_TRIGGERS_TABLE = os.getenv("GUARDRAIL_TRIGGERS_TABLE", "guardrail_triggers")
+
+def post_system_message(conversation_id: str, content: str, meta: dict | None = None):
+    """
+    Optional: lets DeRad appear as a system message (⚙️) in the conversation UI.
+    Your UI already supports author_type="system".
+    """
+    secure_supabase.table("mvp_messages").insert({
+        "conversation_id": conversation_id,
+        "author_id": None,
+        "author_type": "system",
+        "content": content,
+        "meta": meta or {},
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+
+@lru_cache(maxsize=1)
+def load_guardrail_triggers() -> list[dict]:
+    """
+    Expects rows like:
+      { phrase: "how to join", is_regex: false, severity: "high", enabled: true }
+    Keep this cached for performance; clear cache if you add an admin 'refresh' button.
+    """
+    try:
+        rows = (
+            secure_supabase.table(GUARDRAIL_TRIGGERS_TABLE)
+            .select("id,pattern,match_type,severity,action,is_active,category,language")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        return rows
+    except Exception:
+        return []
+
+def _match_trigger(text: str, trig: dict) -> bool:
+    text = text or ""
+    s = text.lower()
+
+    pattern = (trig.get("pattern") or "").strip()
+    if not pattern:
+        return False
+
+    match_type = (trig.get("match_type") or "phrase").lower()
+
+    if match_type == "regex":
+        try:
+            return bool(re.search(pattern, text, flags=re.IGNORECASE))
+        except Exception:
+            return False
+
+    # default phrase match
+    return pattern.lower() in s
+
+def guardrail_detect(question: str):
+    triggers = load_guardrail_triggers()
+    matched_patterns = []
+    matched_ids = []
+    max_sev = 0  # smallint in DB
+
+    for t in triggers:
+        if _match_trigger(question, t):
+            matched_ids.append(t.get("id"))
+            matched_patterns.append(t.get("pattern", ""))
+            sev = int(t.get("severity") or 0)
+            if sev > max_sev:
+                max_sev = sev
+
+    return (len(matched_patterns) > 0, matched_ids[:20], matched_patterns[:20], max_sev)
+
+def _search_derad_collection(query_text: str, top_k: int = 8) -> list[dict]:
+    """
+    Attempts DeRad search robustly:
+    - tries 384 embedding first, then 768 (if dimension mismatch)
+    - tries typical field sets for output_fields
+    Returns list of dicts with keys: text, source, distance
+    """
+    if not utility.has_collection(DERAD_COLLECTION):
+        return []
+
+    col = Collection(DERAD_COLLECTION)
+
+    # candidates for output fields; we try in order
+    field_sets = [
+        ["Text", "Source", "agent_id"],
+        ["Text", "Source"],
+        ["text", "source"],
+    ]
+
+    # candidates for embeddings; we try in order
+    vecs = []
+    try:
+        vecs.append(np.asarray(generate_embedding(query_text), dtype=np.float32))
+    except Exception:
+        pass
+
+    try:
+        vecs.append(embed_arabic_768(query_text))
+    except Exception:
+        pass
+
+    last_err = None
+    for vec in vecs:
+        for fields in field_sets:
+            try:
+                results = col.search(
+                    data=[vec],
+                    anns_field="vector",
+                    param={"metric_type": "COSINE", "params": {"nprobe": 10}},
+                    limit=top_k,
+                    output_fields=fields,
+                )
+                if not results or not results[0]:
+                    return []
+
+                out = []
+                for hit in results[0]:
+                    ent = hit.entity
+                    txt = _safe_ent_get(ent, "Text", "") or _safe_ent_get(ent, "text", "")
+                    src = _safe_ent_get(ent, "Source", "") or _safe_ent_get(ent, "source", "")
+                    out.append({
+                        "text": txt,
+                        "source": src,
+                        "distance": getattr(hit, "distance", 0.0),
+                    })
+                return out
+            except Exception as e:
+                last_err = e
+                continue
+
+    # optional: log last_err somewhere if you want
+    return []
+
+
+def run_derad_guardrail(question: str, personality: dict | None = None) -> tuple[bool, str, dict]:
+    """
+    Returns:
+      (triggered, derad_response, meta)
+    If triggered=True, you should SKIP the normal agent run and return this response instead.
+    """
+    triggered, matched_ids, matched_patterns, max_severity = guardrail_detect(question)
+    if not triggered:
+        return (False, "", {})
+
+    hits = _norm(_search_derad_collection(question, top_k=8))
+    sources = ", ".join(sorted({h.get("source") for h in hits if h.get("source")}))
+
+    # Build a small RAG context from DeRad collection
+    ctx_blocks = []
+    for h in hits[:6]:
+        if h.get("text"):
+            ctx_blocks.append(f"- {h['text']}")
+    derad_context = "\n".join(ctx_blocks).strip()
+
+    system_prompt = (
+        "You are DeRad, a safety and guidance assistant. "
+        "Provide a non-radical, mainstream response. "
+        "If the question is about harming others, illegal activity, or violent extremism, refuse to assist with harm. "
+        "Instead, redirect to peaceful, lawful, ethical perspectives and encourage seeking help from trusted local community leaders or professionals. "
+        "Keep the tone respectful and calm. "
+        f"{'Use the provided sources where relevant.' if sources else ''}"
+    )
+
+    user_context = (
+        f"Question:\n{question}\n\n"
+        f"DeRad reference context:\n{derad_context}\n\n"
+        f"Available sources: {sources}\n"
+    )
+
+    # Use cheap model route; you can change purpose if you want
+    reply, tokens, cost = query_openai_context(
+        prompt=system_prompt,
+        context=user_context,
+        purpose="peer_review",
+        personality=personality,
+    )
+
+    meta = {
+        "guardrail": True,
+        "matched_trigger_ids": matched_ids,
+        "matched_patterns": matched_patterns,
+        "max_severity": max_severity,
+        "sources": sources.split(", ") if sources else [],
+        "tokens": tokens,
+        "cost": cost,
+        "derad_collection": DERAD_COLLECTION,
+    }
+    return (True, reply or "", meta)
+
+# ---------log Guardrail events----------------------
+def _sev_to_smallint(value) -> int:
+    """
+    Supports both:
+    - old style: 'low'/'medium'/'high'
+    - new style: numeric severity (0/1/2/3...)
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    s = str(value).strip().lower()
+    return {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+    }.get(s, 0)
+
+
+def log_guardrail_event(
+    user_id: str | None,
+    question: str,
+    meta: dict | None = None,
+    conversation_id: str | None = None,
+    message_id: str | None = None,
+    decision: str = "DERAD_ONLY",
+):
+    """
+    Writes a row to public.guardrail_events.
+    Compatible with both your current meta keys and the future schema-aligned ones.
+    """
+    meta = meta or {}
+
+    # Backwards compatibility with current run_derad_guardrail meta
+    matched_patterns = (
+        meta.get("matched_patterns")
+        or meta.get("matched_triggers")
+        or []
+    )
+
+    matched_trigger_ids = meta.get("matched_trigger_ids") or []
+
+    max_severity = _sev_to_smallint(
+        meta.get("max_severity", meta.get("severity"))
+    )
+
+    payload = {
+        "user_id": user_id,
+        "conversation_id": conversation_id,
+        "message_id": message_id,
+        "input_text": (question or "")[:4000],   # avoid overly long payloads
+        "triggered": True,
+        "decision": decision,
+        "matched_trigger_ids": matched_trigger_ids,
+        "matched_patterns": matched_patterns,
+        "max_severity": max_severity,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    # Remove keys with None if your table/RLS is strict
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    secure_supabase.table("guardrail_events").insert(payload).execute()
+
+# --------- Sprint 3 Admin / Observability helpers ---------
+
+def _sev_label(v: int) -> str:
+    try:
+        return {1: "low", 2: "medium", 3: "high"}.get(int(v or 0), "unknown")
+    except Exception:
+        return "unknown"
+
+
+def get_runtime_flag(key: str, default: str = "false") -> str:
+    try:
+        row = (
+            secure_supabase.table("app_runtime_flags")
+            .select("value")
+            .eq("key", key)
+            .maybe_single()
+            .execute()
+            .data
+        ) or {}
+        return str(row.get("value", default)).strip().lower()
+    except Exception:
+        return default.lower()
+
+
+def set_runtime_flag(key: str, value: str):
+    secure_supabase.table("app_runtime_flags").upsert({
+        "key": key,
+        "value": str(value).strip().lower(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+
+def guardrails_enabled() -> bool:
+    return get_runtime_flag("guardrails_enabled", "true") in ("1", "true", "yes", "on")
+
+
+def validate_trigger_pattern(pattern: str, match_type: str) -> tuple[bool, str]:
+    p = (pattern or "").strip()
+    mt = (match_type or "phrase").strip().lower()
+
+    if not p:
+        return False, "Pattern is required."
+
+    if mt == "regex":
+        try:
+            re.compile(p, flags=re.IGNORECASE)
+        except re.error as e:
+            return False, f"Invalid regex: {e}"
+
+    return True, ""
+
+
+def list_guardrail_triggers_admin(
+    language: str = "all",
+    severity: str = "all",
+    active: str = "all",
+):
+    q = (
+        secure_supabase.table("guardrail_triggers")
+        .select("id,pattern,match_type,language,category,severity,action,is_active,notes,updated_at,created_at")
+        .order("severity", desc=True)
+        .order("updated_at", desc=True)
+    )
+
+    if language != "all":
+        q = q.eq("language", language)
+
+    if severity != "all":
+        q = q.eq("severity", int(severity))
+
+    if active == "active":
+        q = q.eq("is_active", True)
+    elif active == "inactive":
+        q = q.eq("is_active", False)
+
+    return q.execute().data or []
+
+
+def save_guardrail_trigger_admin(
+    trigger_id: str | None,
+    pattern: str,
+    match_type: str,
+    language: str,
+    category: str,
+    severity: int,
+    action: str,
+    is_active: bool,
+    notes: str,
+    created_by: str | None = None,
+):
+    ok, msg = validate_trigger_pattern(pattern, match_type)
+    if not ok:
+        raise ValueError(msg)
+
+    payload = {
+        "pattern": (pattern or "").strip(),
+        "match_type": (match_type or "phrase").strip().lower(),
+        "language": (language or "en").strip().lower(),
+        "category": (category or "general").strip().lower(),
+        "severity": int(severity),
+        "action": (action or "CONFIRM").strip().upper(),
+        "is_active": bool(is_active),
+        "notes": (notes or "").strip(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    if trigger_id:
+        secure_supabase.table("guardrail_triggers").update(payload).eq("id", trigger_id).execute()
+    else:
+        if created_by:
+            payload["created_by"] = created_by
+        secure_supabase.table("guardrail_triggers").insert(payload).execute()
+
+    # clear trigger cache used by guardrail runtime
+    try:
+        load_guardrail_triggers.cache_clear()
+    except Exception:
+        pass
+
+
+def set_guardrail_trigger_active(trigger_id: str, active: bool):
+    secure_supabase.table("guardrail_triggers").update({
+        "is_active": bool(active),
+        "updated_at": datetime.utcnow().isoformat(),
+    }).eq("id", trigger_id).execute()
+
+    try:
+        load_guardrail_triggers.cache_clear()
+    except Exception:
+        pass
+
+
+def list_guardrail_events_admin(
+    limit: int = 200,
+    severity: str = "all",
+    language: str = "all",
+    decision: str = "all",
+):
+    q = (
+        secure_supabase.table("guardrail_events")
+        .select("id,created_at,user_id,conversation_id,message_id,decision,triggered,max_severity,language,latency_ms,matched_patterns,input_text")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+
+    if severity != "all":
+        q = q.eq("max_severity", int(severity))
+    if language != "all":
+        q = q.eq("language", language)
+    if decision != "all":
+        q = q.eq("decision", decision)
+
+    return q.execute().data or []
+
+
+def get_guardrail_metrics_admin(days: int = 7):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase.table("guardrail_events")
+        .select("triggered,decision,latency_ms,max_severity,created_at")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data
+        or []
+    )
+
+    total = len(rows)
+    triggered_count = sum(1 for r in rows if r.get("triggered") is True)
+
+    decision_counts = {
+        "ALLOW_NORMAL": 0,
+        "ADD_DERAD_NOTE": 0,
+        "DERAD_ONLY": 0,
+    }
+    sev_counts = {1: 0, 2: 0, 3: 0}
+    lats = []
+
+    for r in rows:
+        d = (r.get("decision") or "").upper()
+        if d in decision_counts:
+            decision_counts[d] += 1
+
+        try:
+            sev = int(r.get("max_severity") or 0)
+            if sev in sev_counts:
+                sev_counts[sev] += 1
+        except Exception:
+            pass
+
+        if r.get("latency_ms") is not None:
+            try:
+                lats.append(int(r.get("latency_ms")))
+            except Exception:
+                pass
+
+    avg_latency_ms = round(sum(lats) / len(lats), 1) if lats else None
+    trigger_rate_pct = round((triggered_count / total) * 100, 1) if total else 0.0
+
+    return {
+        "total_checks": total,
+        "triggered": triggered_count,
+        "trigger_rate_pct": trigger_rate_pct,
+        "avg_latency_ms": avg_latency_ms,
+        "decision_counts": decision_counts,
+        "severity_counts": sev_counts,
+    }
+
 # ---- Model/collection registry (add more rows later) ----
 EMBED_REGISTRY = [
     {
@@ -224,14 +701,23 @@ def query_openai_context(prompt, context, purpose="default", personality=None):
             f"{'When possible, cite sources provided by the user.' if personality.get('citations', True) else ''}"
         )
 
-    ls = (personality or {}).get("learning_support")
-    if ls and "SEN" in ls:
+    ctx = get_learning_context()
+    sys = apply_learning_support(sys, personality, ctx)
+
+    ls = (personality or {}).get("learning_support") or []
+    ls_text = " ".join(ls).lower() if isinstance(ls, list) else str(ls).lower()
+
+    if "sen" in ls_text:
         sys += " Use simple language, short steps, and check understanding. Avoid jargon."
-    elif ls and "Dyslexia" in ls:
+    elif "dyslexia" in ls_text:
         sys += " Use short sentences, clear structure, and avoid dense paragraphs."
-    elif ls and "ADHD" in ls:
-        sys += " Keep responses brief, bullet-pointed, and step-by-step."
-    elif ls and "EAL" in ls:
+    elif "adhd" in ls_text:
+        sys += (
+            " Respond in 4 short bullet points maximum. "
+            "Each bullet must be 1 short sentence. "
+            "Then ask 1 quick check question."
+        )
+    elif "eal" in ls_text:
         sys += " Use simple English, define key words, and give one example."
 
     response = openai_client.chat.completions.create(
@@ -258,33 +744,132 @@ def query_openai_context(prompt, context, purpose="default", personality=None):
         "company_id": user["company_id"],
         "user_id": user["id"],
         "bill_to_company_id": user.get("company_id"),
-        "external_user_id": None,
         "plan_code": get_user_plan(user["id"]),
         "agent_id": st.session_state.get("active_agent_id"),
-        "request_type": purpose,  # e.g. "peer_review" / "consensus"
-        "subject": None,
-        "year_group": None,
-        "topic": None,
+        "request_type": purpose,
     }
 
-    log_llm_usage(
-        company_id=meta["company_id"],
-        user_id=meta["user_id"],
-        bill_to_company_id=meta["bill_to_company_id"],
-        external_user_id=meta["external_user_id"],
-        plan_code=meta["plan_code"],
-        agent_id=meta["agent_id"],
-        request_type=meta["request_type"],
-        subject=meta["subject"],
-        year_group=meta["year_group"],
-        topic=meta["topic"],
-        provider="openai",
-        model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+    ctx = get_learning_context()
+
+    meta["external_user_id"] = ctx.get("external_user_id") or get_qp("external_user_id")
+    meta["subject"] = ctx.get("subject") or get_qp("subject")
+    meta["year_group"] = ctx.get("year_group") or get_qp("year_group")
+    meta["topic"] = ctx.get("topic") or get_qp("topic")
+
+    cost_est = log_llm_usage(
+    company_id=meta["company_id"],
+    user_id=meta["user_id"],
+    bill_to_company_id=meta["bill_to_company_id"],
+    external_user_id=meta["external_user_id"],
+    plan_code=meta["plan_code"],
+    agent_id=meta["agent_id"],
+    request_type=meta["request_type"],
+    subject=meta["subject"],
+    year_group=meta["year_group"],
+    topic=meta["topic"],
+    provider="openai",
+    model=model,
+    prompt_tokens=prompt_tokens,
+    completion_tokens=completion_tokens,
+)
+
+    return answer, (prompt_tokens + completion_tokens), float(cost_est or 0.0)
+
+def resolve_agent_id_from_subject(subject: str | None) -> str | None:
+    settings = st.session_state.get("company_settings") or {}
+    subject_map = settings.get("subject_agent_map") or {}
+    fallback = settings.get("fallback_agent_id")
+    s = (subject or "").strip()
+    return subject_map.get(s) or fallback
+
+def get_qp(name: str, default=None):
+    """Read a URL query param safely across Streamlit versions."""
+    try:
+        v = st.query_params.get(name)
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v if v is not None else default
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name) or [default])[0]
+
+def apply_learning_support(sys: str, personality: dict | None, ctx: dict | None = None) -> str:
+    """
+    Adds enforceable formatting/behaviour rules based on learning support preferences.
+    Keep MVP-safe: predictable structure and short responses.
+    """
+    personality = personality or {}
+    ctx = ctx or {}
+
+    # Learning support selector normalisation (works for list or string)
+    ls = personality.get("learning_support") or ctx.get("support_profile") or ""
+    ls_text = " ".join(ls).lower() if isinstance(ls, list) else str(ls).lower()
+
+    # Optional behaviour flags (if you store them later)
+    examples_first = bool(personality.get("examples_first", False))
+    check_understanding = bool(personality.get("check_understanding", False))
+    voice_mode = bool(ctx.get("voice_mode", False)) or bool(personality.get("prefer_voice", False))
+
+    # Always-safe tutor tone (good for displaced learners and SEN without needing to mention trauma)
+    sys += (
+        " Be calm, kind, and non-judgemental. "
+        "Avoid shaming language. "
+        "Use neutral examples that do not assume culture, location, or background. "
     )
 
-    return answer, (prompt_tokens + completion_tokens), None
+    # Voice-mode (spoken-friendly)
+    if voice_mode:
+        sys += (
+            " Voice mode: use very short sentences. "
+            "One idea at a time. "
+            "Avoid long bullet lists. "
+        )
+
+    # Support profiles (make them enforceable)
+    if "Special Educational Needs" in ls_text:
+        sys += (
+            " SEN support: explain in tiny steps. "
+            "Use 3 short bullet points maximum. "
+            "No paragraphs"
+        )
+
+    elif "Dyslexia" in ls_text:
+        sys += (
+            " Dyslexia-friendly: use short lines and lots of spacing. "
+            "Avoid dense paragraphs. "
+            "Use headings and bullets. "
+            "Do not use italics or complex punctuation. "
+            "Max 140 words unless asked for more. "
+        )
+
+    elif "ADHD" in ls_text:
+        sys += (
+            " ADHD-friendly: IMPORTANT formatting rule. "
+            "Output MUST be 4 bullet points maximum. "
+            "Each bullet MUST be 1 short sentence. "
+            "No paragraphs. "
+        )
+
+    elif "EAL" in ls_text:
+        sys += (
+            " EAL support: use simple English. "
+            "Define any key word in 1 short sentence. "
+            "Give 1 clear example. "
+            "Avoid idioms and slang. "
+            "Max 140 words unless asked for more. "
+        )
+
+    # Optional behaviour modifiers
+    if examples_first:
+        sys += " Start with a simple example before explaining rules."
+    if check_understanding:
+        sys += " End with ONE quick check question (e.g., 'Does that make sense?')."
+
+    return sys
+
+def get_learning_context() -> dict:
+    """Single source of truth for embed/topic context used across prompts + logging."""
+    return st.session_state.get("learning_context") or {}
 
 def query_agent_context(prompt: str, context: str, personality=None):
     """
@@ -303,6 +888,9 @@ def query_agent_context(prompt: str, context: str, personality=None):
             f"Prefer a maximum of {personality.get('max_words',180)} words. "
             f"{'When possible, cite sources provided by the user.' if personality.get('citations', True) else ''}"
         )
+
+    ctx = get_learning_context()
+    sys = apply_learning_support(sys, personality, ctx)
 
     ls = (personality or {}).get("learning_support")
     if ls and "SEN" in ls:
@@ -332,22 +920,26 @@ def query_agent_context(prompt: str, context: str, personality=None):
             pt = count_tokens(full_input)
             ct = count_tokens(answer)
 
-        log_llm_usage(
+        ctx = get_learning_context()
+
+        cost_est = log_llm_usage(
             company_id=user["company_id"],
             user_id=user["id"],
             bill_to_company_id=user.get("company_id"),
-            external_user_id=None,
+            external_user_id=ctx.get("external_user_id") or get_qp("external_user_id"),
             plan_code=get_user_plan(user["id"]),
             agent_id=st.session_state.get("active_agent_id"),
             request_type="agent_turn",
-            subject=None, year_group=None, topic=None,
+            subject=ctx.get("subject") or get_qp("subject"),
+            year_group=ctx.get("year_group") or get_qp("year_group"),
+            topic=ctx.get("topic") or get_qp("topic"),
             provider=provider_name,
             model=model_name,
             prompt_tokens=pt,
             completion_tokens=ct,
         )
 
-        return answer, (pt + ct), None
+        return answer, (pt + ct), float(cost_est or 0.0)
 
     try:
         if provider == "grok" and grok_client:
@@ -676,6 +1268,12 @@ def log_llm_usage(
 
     secure_supabase.table("llm_usage").insert(row).execute()
 
+    # MVP: return gross/sell cost so UI can display it
+    try:
+        return float(row.get("sell_price_gbp") or 0.0)
+    except Exception:
+        return 0.0
+
 # ---------- Sprint 3: conversations helpers ----------
 from typing import List, Dict, Any
 
@@ -748,7 +1346,7 @@ def list_messages(conversation_id: str, limit: int = 300):
         .data or []
     )
 
-# ---- Projects minimal (Sprint 2) ----
+# ---- Projects minimal ----
 def list_projects(company_id: str):
     res = secure_supabase.table("projects").select("id,name").eq("company_id", company_id).execute()
     return res.data or []
@@ -926,13 +1524,150 @@ def restore_supabase_session():
             st.session_state.pop("sb_access_token", None)
             st.session_state.pop("sb_refresh_token", None)
 
-# --- Auth bootstrap (place this AFTER login_page() and restore_supabase_session() defs) ---
-restore_supabase_session()
-sess = supabase.auth.get_session()
-if not (sess and sess.user):
-    st.session_state.pop("user", None)
-    login_page()
-    st.stop()
+def _get_qp(name: str):
+    """Read query params across Streamlit versions."""
+    try:
+        v = st.query_params.get(name)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    except Exception:
+        qp = st.experimental_get_query_params()
+        return (qp.get(name) or [None])[0]
+
+
+def verify_embed_token(token: str) -> dict | None:
+    if not EMBED_SHARED_SECRET:
+        st.error("EMBED_SHARED_SECRET is not set in your environment.")
+        return None
+    try:
+        # requires exp if you set it in Phase 4
+        payload = jwt.decode(
+            token,
+            EMBED_SHARED_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp"]},
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        st.warning("This help link has expired. Please reopen help from the app.")
+        return None
+    except Exception:
+        st.error("Invalid help link (embed token).")
+        return None
+
+
+def get_or_create_embedded_user(company_id: str, external_user_id: str) -> dict | None:
+    """
+    Finds or creates the internal Users row and the external_identities mapping.
+    Uses secure_supabase (service role) because embedded students have no Supabase Auth session.
+    """
+    # 1) Resolve via external_identities
+    row = (
+        secure_supabase.table("external_identities")
+        .select("user_id")
+        .eq("company_id", company_id)
+        .eq("external_user_id", external_user_id)
+        .maybe_single()
+        .execute()
+        .data
+        or {}
+    )
+
+    uid = row.get("user_id")
+
+    if not uid:
+        # 2) Optional auto-provision (works if Users has no FK to auth.users)
+        uid = str(uuid4())
+        pseudo_email = f"embedded+{external_user_id}@local"
+
+        try:
+            secure_supabase.table("Users").insert(
+                {
+                    "id": uid,
+                    "email": pseudo_email,
+                    "company_id": company_id,
+                    "is_admin": False,
+                    "is_agent": False,
+                    "plan": "free",
+                }
+            ).execute()
+
+            secure_supabase.table("external_identities").insert(
+                {
+                    "company_id": company_id,
+                    "external_user_id": external_user_id,
+                    "user_id": uid,
+                }
+            ).execute()
+        except Exception as e:
+            st.error(
+                "No external identity mapping exists, and auto-provisioning failed. "
+                "Create a row in external_identities for this student."
+            )
+            st.exception(e)
+            return None
+
+    # Minimal user dict (so your sidebar doesn’t KeyError on user['email']) :contentReference[oaicite:2]{index=2}
+    return {
+        "id": uid,
+        "email": f"embedded:{external_user_id}",
+        "company_id": company_id,
+        "is_admin": False,
+    }
+
+
+def try_bootstrap_embedded_session() -> bool:
+    """
+    If embed_token is present and valid:
+      - sets st.session_state['user']
+      - marks embedded mode
+      - stores learning_context (subject/year/topic etc.)
+    """
+    token = _get_qp("embed_token")
+    if not token:
+        return False
+
+    payload = verify_embed_token(token)
+    if not payload:
+        st.stop()
+
+    company_id = payload.get("company_id")
+    external_user_id = payload.get("external_user_id")
+
+    if not company_id or not external_user_id:
+        st.error("Embed token is missing company_id or external_user_id.")
+        st.stop()
+
+    user = get_or_create_embedded_user(company_id, external_user_id)
+    if not user:
+        st.stop()
+
+    st.session_state["user"] = user
+    st.session_state["is_embedded"] = True
+
+    st.session_state["learning_context"] = {
+        "external_user_id": external_user_id,
+        "company_id": company_id,
+        "subject": payload.get("subject"),
+        "year_group": payload.get("year_group"),
+        "topic": payload.get("topic"),
+        "support_profile": payload.get("support_profile") or [],
+        "tier": payload.get("tier", "free"),
+        "source": payload.get("source", "school_app"),
+        "voice_mode": bool(payload.get("voice_mode", False)),
+    }
+
+    return True
+
+# --- Auth bootstrap (embedded first, otherwise normal login) ---
+if not try_bootstrap_embedded_session():
+    restore_supabase_session()
+    sess = supabase.auth.get_session()
+    if not (sess and sess.user):
+        st.session_state.pop("user", None)
+        login_page()
+        st.stop()
 
 # --------- 4. Sidebar UI ---------
 # --- Auth guard (prevents KeyError after logout) ---
@@ -951,13 +1686,24 @@ if not user:
         st.stop()  # stop rendering until login_page sets/returns a user
 
     # Persist to session for next rerun
-    st.session_state["user"] = user
+db = secure_supabase if st.session_state.get("is_embedded") else supabase
 
-comp = supabase.table("companies") \
-               .select("name,logo_url") \
-               .eq("id", user["company_id"]) \
-               .maybe_single() \
-               .execute().data or {}
+comp = db.table("companies") \
+    .select("name,logo_url,settings") \
+    .eq("id", user["company_id"]) \
+    .maybe_single() \
+    .execute().data or {}
+
+st.session_state["company_settings"] = comp.get("settings") or {}
+
+# ---------------- Set active agent from embed context (preferred) ----------------
+ctx = get_learning_context()
+
+# Prefer embed token context; fall back to URL param for local testing
+subject = ctx.get("subject") or get_qp("subject")
+
+if subject:
+    st.session_state["active_agent_id"] = resolve_agent_id_from_subject(subject)
 
 # Pick logo (fallback to local image)
 logo_url = comp.get("logo_url") or "RABIIT.jpg"
@@ -1005,9 +1751,12 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🧭 My Personality")
 
 _curr = load_user_personality(user["id"], user["company_id"])
+st.sidebar.caption(f"DEBUG saved learning_support: {(_curr or {}).get('learning_support')}")
+
 tone  = st.sidebar.selectbox("Tone", ["Balanced","Analytical","Strategic","Supportive","Challenger"],
                              index=["Balanced","Analytical","Strategic","Supportive","Challenger"].index(_curr.get("tone","Balanced")))
 style = st.sidebar.selectbox("Style", ["Concise","Detailed"], index=0 if _curr.get("style","Concise")=="Concise" else 1)
+
 support_options = [
     "Prefer not to say",
     "No additional support",
@@ -1044,7 +1793,12 @@ def admin_page():
     st.title("🛠️ Admin Panel")
     st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
 
-    tab1, tab2 = st.tabs(["Manage Agents", "Role Prompts"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Manage Agents",
+        "Role Prompts",
+        "Guardrails",
+        "Guardrail Events",
+    ])
 
     # --- TAB 1: Agent Description ---
     with tab1:
@@ -1102,6 +1856,222 @@ def admin_page():
                 st.rerun()
             else:
                 st.warning("Both fields are required.")
+
+    # --- TAB 3: Guardrails ---
+    with tab3:
+        st.subheader("🛡️ Guardrail Management")
+
+        # Kill switch
+        current_enabled = guardrails_enabled()
+        new_enabled = st.toggle(
+            "Guardrails enabled",
+            value=current_enabled,
+            help="Emergency rollback switch",
+        )
+        if new_enabled != current_enabled:
+            set_runtime_flag("guardrails_enabled", "true" if new_enabled else "false")
+            st.success(f"Guardrails {'enabled' if new_enabled else 'disabled'}.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Trigger filters")
+        c1, c2, c3 = st.columns(3)
+        flt_lang = c1.selectbox("Language", ["all", "en", "ar", "any"], index=0, key="gr_filter_lang")
+        flt_sev = c2.selectbox(
+            "Severity",
+            ["all", "3", "2", "1"],
+            index=0,
+            key="gr_filter_sev",
+            format_func=lambda x: {"all": "all", "1": "low", "2": "medium", "3": "high"}.get(x, x),
+        )
+        flt_status = c3.selectbox("Status", ["all", "active", "inactive"], index=0, key="gr_filter_status")
+
+        triggers = list_guardrail_triggers_admin(language=flt_lang, severity=flt_sev, active=flt_status)
+
+        st.markdown("### Existing triggers")
+        if not triggers:
+            st.info("No triggers found for the selected filters.")
+
+        for t in triggers:
+            tid = t["id"]
+            sev_label = _sev_label(t.get("severity"))
+            state_badge = "✅" if t.get("is_active") else "⛔"
+            title = f"{state_badge} {sev_label.upper()} | {t.get('language','-')} | {t.get('category','general')} | {t.get('pattern','')}"
+            with st.expander(title):
+                left, right = st.columns([2, 1])
+
+                pattern = left.text_input("Pattern", value=t.get("pattern", ""), key=f"gr_pattern_{tid}")
+
+                mt_options = ["keyword", "phrase", "regex"]
+                current_mt = (t.get("match_type") or "phrase").lower()
+                mt_idx = mt_options.index(current_mt) if current_mt in mt_options else 1
+                match_type = left.selectbox("Match type", mt_options, index=mt_idx, key=f"gr_mt_{tid}")
+
+                lang_options = ["en", "ar", "any"]
+                current_lang = (t.get("language") or "en").lower()
+                lang_idx = lang_options.index(current_lang) if current_lang in lang_options else 0
+                language = left.selectbox("Language", lang_options, index=lang_idx, key=f"gr_lang_{tid}")
+
+                category = left.text_input("Category", value=t.get("category") or "general", key=f"gr_cat_{tid}")
+                notes = left.text_area("Notes", value=t.get("notes") or "", height=70, key=f"gr_notes_{tid}")
+
+                sev_options = [1, 2, 3]
+                curr_sev = int(t.get("severity") or 1)
+                sev_idx = sev_options.index(curr_sev) if curr_sev in sev_options else 0
+                severity = right.selectbox(
+                    "Severity",
+                    sev_options,
+                    index=sev_idx,
+                    key=f"gr_sev_{tid}",
+                    format_func=lambda x: f"{x} ({_sev_label(x)})",
+                )
+
+                action_options = ["CONFIRM", "ADD_DERAD_NOTE", "DERAD_ONLY", "ALLOW"]
+                current_action = (t.get("action") or "CONFIRM").upper()
+                act_idx = action_options.index(current_action) if current_action in action_options else 0
+                action = right.selectbox("Action", action_options, index=act_idx, key=f"gr_act_{tid}")
+
+                is_active = right.checkbox("Active", value=bool(t.get("is_active")), key=f"gr_active_{tid}")
+
+                b1, b2 = st.columns(2)
+                if b1.button("Save trigger", key=f"gr_save_{tid}"):
+                    try:
+                        save_guardrail_trigger_admin(
+                            trigger_id=tid,
+                            pattern=pattern,
+                            match_type=match_type,
+                            language=language,
+                            category=category,
+                            severity=int(severity),
+                            action=action,
+                            is_active=is_active,
+                            notes=notes,
+                            created_by=user["id"] if "user" in globals() and user else None,
+                        )
+                        st.success("Trigger saved.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+                if b2.button("Disable" if is_active else "Enable", key=f"gr_toggle_{tid}"):
+                    try:
+                        set_guardrail_trigger_active(tid, not is_active)
+                        st.success("Trigger status updated.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+        st.markdown("---")
+        st.subheader("➕ Add New Trigger")
+
+        l1, l2 = st.columns([2, 1])
+
+        new_pattern = l1.text_input("Pattern", key="gr_new_pattern")
+        new_match_type = l1.selectbox("Match type", ["keyword", "phrase", "regex"], index=1, key="gr_new_mt")
+        new_language = l1.selectbox("Language", ["en", "ar", "any"], index=0, key="gr_new_lang")
+        new_category = l1.text_input("Category", value="general", key="gr_new_category")
+        new_notes = l1.text_area("Notes", height=70, key="gr_new_notes")
+
+        new_severity = l2.selectbox(
+            "Severity",
+            [1, 2, 3],
+            index=1,
+            key="gr_new_sev",
+            format_func=lambda x: f"{x} ({_sev_label(x)})",
+        )
+        new_action = l2.selectbox(
+            "Action",
+            ["CONFIRM", "ADD_DERAD_NOTE", "DERAD_ONLY", "ALLOW"],
+            index=0,
+            key="gr_new_action",
+        )
+        new_active = l2.checkbox("Active", value=True, key="gr_new_active")
+
+        if st.button("Add trigger", key="gr_add"):
+            try:
+                save_guardrail_trigger_admin(
+                    trigger_id=None,
+                    pattern=new_pattern,
+                    match_type=new_match_type,
+                    language=new_language,
+                    category=new_category,
+                    severity=int(new_severity),
+                    action=new_action,
+                    is_active=new_active,
+                    notes=new_notes,
+                    created_by=user["id"] if "user" in globals() and user else None,
+                )
+                st.success("Trigger added.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    # --- TAB 4: Guardrail Events ---
+    with tab4:
+        st.subheader("📊 Guardrail Events")
+
+        days = st.selectbox("Window", [1, 7, 14, 30], index=1, format_func=lambda d: f"Last {d} day(s)")
+        metrics = get_guardrail_metrics_admin(days=days)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Checks", metrics["total_checks"])
+        m2.metric("Triggered", metrics["triggered"])
+        m3.metric("Trigger rate", f"{metrics['trigger_rate_pct']}%")
+        m4.metric(
+            "Avg latency",
+            f"{metrics['avg_latency_ms']} ms" if metrics["avg_latency_ms"] is not None else "n/a"
+        )
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("ALLOW_NORMAL", metrics["decision_counts"].get("ALLOW_NORMAL", 0))
+        d2.metric("ADD_DERAD_NOTE", metrics["decision_counts"].get("ADD_DERAD_NOTE", 0))
+        d3.metric("DERAD_ONLY", metrics["decision_counts"].get("DERAD_ONLY", 0))
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("High", metrics["severity_counts"].get(3, 0))
+        s2.metric("Medium", metrics["severity_counts"].get(2, 0))
+        s3.metric("Low", metrics["severity_counts"].get(1, 0))
+
+        st.markdown("---")
+        f1, f2, f3 = st.columns(3)
+        ev_sev = f1.selectbox(
+            "Severity",
+            ["all", "3", "2", "1"],
+            index=0,
+            key="ev_filter_sev",
+            format_func=lambda x: {"all": "all", "1": "low", "2": "medium", "3": "high"}.get(x, x),
+        )
+        ev_lang = f2.selectbox("Language", ["all", "en", "ar"], index=0, key="ev_filter_lang")
+        ev_dec = f3.selectbox(
+            "Decision",
+            ["all", "ALLOW_NORMAL", "ADD_DERAD_NOTE", "DERAD_ONLY"],
+            index=0,
+            key="ev_filter_dec",
+        )
+
+        rows = list_guardrail_events_admin(limit=200, severity=ev_sev, language=ev_lang, decision=ev_dec)
+
+        if not rows:
+            st.info("No events found.")
+        else:
+            for r in rows:
+                ts = (r.get("created_at") or "")[:19]
+                sev = _sev_label(r.get("max_severity"))
+                lang = r.get("language") or "-"
+                decision = r.get("decision") or "UNKNOWN"
+                with st.expander(f"{ts} | {decision} | {sev} | {lang}"):
+                    st.write("**Input**")
+                    st.write(r.get("input_text") or "")
+                    st.write("**Matched patterns**")
+                    st.json(r.get("matched_patterns") or [])
+                    st.write("**Latency**")
+                    st.write(f"{r.get('latency_ms')} ms" if r.get("latency_ms") is not None else "n/a")
+                    st.write("**IDs**")
+                    st.write({
+                        "user_id": r.get("user_id"),
+                        "conversation_id": r.get("conversation_id"),
+                        "message_id": r.get("message_id"),
+                    })
 
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
@@ -1508,8 +2478,34 @@ if is_paid:
                         refined_q = facilitator_gate(supabase, project_id, user["id"], allowed_ids, text.strip())
 
                         # Save the user's message with audit meta
-                        post_user_message(conv_id, user["id"], refined_q,
-                                          meta={"agents_requested": selected_agent_ids, "agents_used": list(allowed_ids)})
+                        user_msg = post_user_message(
+                            conv_id,
+                            user["id"],
+                            refined_q,
+                            meta={"agents_requested": selected_agent_ids, "agents_used": list(allowed_ids)}
+                        )
+
+                        # >>> Guardrail gatekeeper (DeRad)
+                        pers = load_user_personality(user['id'], user['company_id'])
+                        hit, derad_reply, derad_meta = run_derad_guardrail(refined_q, personality=pers)
+                        if hit:
+
+                            # Log guardrail event (Sprint 3C)
+                            try:
+                                log_guardrail_event(
+                                    user_id=user["id"],
+                                    question=refined_q,
+                                    meta=derad_meta,
+                                    conversation_id=conv_id,
+                                    message_id=user_msg.get("id"),
+                                    decision="DERAD_ONLY",
+                                )
+                            except Exception as e:
+                                # Do not break the chat if logging fails
+                                st.warning(f"Guardrail log failed: {e}")
+
+                            post_system_message(conv_id, f"[DeRad] {derad_reply}", meta=derad_meta)
+                            st.rerun()  # show the new messages immediately
 
                         if ask_agents and allowed_ids:
                             # ↓↓↓ run agents only when allowed & requested ↓↓↓
@@ -1581,6 +2577,25 @@ if not is_paid:
             st.warning("Please select at least one public agent in the sidebar.")
         else:
             pers = load_user_personality(user['id'], user['company_id'])
+
+                    # >>> Guardrail gatekeeper (DeRad) — ADD HERE
+            hit, derad_reply, derad_meta = run_derad_guardrail(question, personality=pers)
+            if hit:
+                try:
+                    log_guardrail_event(
+                        user_id=user["id"] if user else None,
+                        question=question,
+                        meta=derad_meta,
+                        conversation_id=None,
+                        message_id=None,
+                        decision="DERAD_ONLY",
+                    )
+                except Exception as e:
+                    st.warning(f"Guardrail log failed: {e}")
+
+                st.info("Safety guidance applied.")
+                st.write(derad_reply)
+                st.stop()
 
             active_agents = [a for a in get_all_agents() if a['id'] in allowed_ids]
 
@@ -1715,6 +2730,12 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
+
+
+
+
+
 
 
 
