@@ -12,7 +12,7 @@ import os, re, numpy as np
 import tiktoken
 import uuid
 import jwt
-from uuid import uuid4
+from typing import Dict, Any, Optional, List
 
 # --------- 1. Setup Connections ---------
 connections.connect(
@@ -144,8 +144,10 @@ def embed_arabic_768(text: str) -> np.ndarray:
     vec = vec[:768] if len(vec) >= 768 else vec
     return np.asarray(vec, dtype=np.float32)
 
-# --------- Guardrail helpers (DeRad gatekeeper) ---------
+# --------- -----------Limited turmns pers tier  ---------
+FREE_MAX_TURNS_PER_SESSION = 20  # simple MVP cap
 
+# ----------Guardrail helpers (DeRad gatekeeper ----------
 DERAD_COLLECTION = os.getenv("DERAD_COLLECTION", "derad")
 GUARDRAIL_TRIGGERS_TABLE = os.getenv("GUARDRAIL_TRIGGERS_TABLE", "guardrail_triggers")
 
@@ -407,7 +409,286 @@ def log_guardrail_event(
 
     secure_supabase.table("guardrail_events").insert(payload).execute()
 
-# --------- Sprint 3 Admin / Observability helpers ---------
+# ---------Memory helpers----------------------
+def get_runtime_context() -> Dict[str, Any]:
+    """
+    Universal context for memory and prompt shaping.
+    Works for education and non-education verticals.
+    """
+
+    user = st.session_state.get("user") or {}
+    learning_context = st.session_state.get("learning_context") or {}
+
+    company_id = user.get("company_id")
+    user_id = user.get("id")
+    project_id = st.session_state.get("active_project_id")
+    agent_id = st.session_state.get("active_agent_id")
+    conversation_id = st.session_state.get("conversation_id")
+
+    # Plan: use session first if you already store it there, otherwise fall back
+    plan_code = (
+        st.session_state.get("user_plan")
+        or st.session_state.get("plan")
+        or "free"
+    )
+
+    # Decide vertical
+    # For now: if learning_context exists, treat as education, otherwise general/corporate
+    if learning_context:
+        vertical = "education"
+        context_json = {
+            "subject": learning_context.get("subject"),
+            "year_group": learning_context.get("year_group"),
+            "topic": learning_context.get("topic"),
+            "external_user_id": learning_context.get("external_user_id"),
+            "support_profile": learning_context.get("support_profile"),
+            "source": learning_context.get("source"),
+        }
+    else:
+        vertical = st.session_state.get("vertical") or "general"
+        context_json = {
+            "department": st.session_state.get("department"),
+            "task_type": st.session_state.get("task_type"),
+            "workspace": st.session_state.get("workspace"),
+        }
+
+    return {
+        "company_id": company_id,
+        "user_id": user_id,
+        "project_id": project_id,
+        "agent_id": agent_id,
+        "conversation_id": conversation_id,
+        "plan_code": plan_code,
+        "vertical": vertical,
+        "external_user_id": learning_context.get("external_user_id"),
+        "context_json": context_json,
+    }
+
+def get_memory_policy(company_id: Optional[str], plan_code: str = "free") -> Dict[str, Any]:
+    """
+    Resolve memory settings for the current company and plan.
+    Uses secure_supabase so it works even if RLS policies are not complete yet.
+    """
+
+    default_policy = {
+        "memory_short_enabled": True,
+        "memory_medium_enabled": False,
+        "memory_long_enabled": False,
+        "memory_vector_enabled": False,
+        "memory_retrieval_limit": 3,
+        "memory_retention_days": 30,
+        "memory_capture_mode": "triggered",
+        "memory_admin_controls": False,
+    }
+
+    if not company_id:
+        return default_policy
+
+    try:
+        # Most specific: exact company + plan
+        res = (
+            secure_supabase
+            .table("company_memory_policies")
+            .select("*")
+            .eq("company_id", company_id)
+            .eq("plan_code", plan_code)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            row = rows[0]
+            return {**default_policy, **row}
+
+        # Fallback: company default policy where plan_code is null
+        res2 = (
+            secure_supabase
+            .table("company_memory_policies")
+            .select("*")
+            .eq("company_id", company_id)
+            .is_("plan_code", "null")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        rows2 = res2.data or []
+        if rows2:
+            row = rows2[0]
+            return {**default_policy, **row}
+
+    except Exception as e:
+        print(f"Memory policy lookup failed: {e}")
+
+    return default_policy
+
+def fetch_recent_thread_messages(conversation_id: Optional[str], limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Get the most recent messages for short-term memory.
+    Returns oldest-to-newest so prompt order is natural.
+    """
+    if not conversation_id:
+        return []
+
+    try:
+        rows = (
+            secure_supabase
+            .table("mvp_messages")
+            .select("author_type, content, meta, created_at")
+            .eq("conversation_id", conversation_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data or []
+        )
+
+        rows.reverse()  # convert newest-first back to oldest-first
+        return rows
+
+    except Exception as e:
+        print(f"Thread fetch failed: {e}")
+        return []
+    
+def format_thread_memory_for_prompt(messages: List[Dict[str, Any]]) -> str:
+    """
+    Turn recent thread messages into prompt text.
+    """
+    if not messages:
+        return ""
+
+    lines = []
+    for m in messages:
+        speaker = "User" if m.get("author_type") == "user" else "Assistant"
+        content = (m.get("content") or "").strip()
+        if content:
+            lines.append(f"{speaker}: {content}")
+
+    if not lines:
+        return ""
+
+    return "\n".join(lines)
+
+def build_memory_expiry(retention_days: int = 30) -> Optional[str]:
+    """
+    Return ISO timestamp for expires_at.
+    """
+    try:
+        days = int(retention_days or 30)
+        return (datetime.utcnow() + timedelta(days=days)).isoformat()
+    except Exception:
+        return None
+
+def save_episode(
+    summary: str,
+    trigger_type: str = "consensus_end",
+    tags: Optional[Dict[str, Any]] = None,
+    turn_id: Optional[str] = None
+) -> None:
+    """
+    Save medium-term episodic memory.
+    """
+    if not summary or not summary.strip():
+        return
+
+    runtime = get_runtime_context()
+    policy = get_memory_policy(runtime.get("company_id"), runtime.get("plan_code", "free"))
+
+    if not policy.get("memory_medium_enabled", False):
+        return
+
+    try:
+        row = {
+            "company_id": runtime.get("company_id"),
+            "user_id": runtime.get("user_id"),
+            "external_user_id": runtime.get("external_user_id"),
+            "conversation_id": runtime.get("conversation_id"),
+            "turn_id": turn_id or str(uuid.uuid4()),
+            "project_id": runtime.get("project_id"),
+            "agent_id": runtime.get("agent_id"),
+            "plan_code": runtime.get("plan_code"),
+            "vertical": runtime.get("vertical", "general"),
+            "memory_type": "episodic",
+            "summary": summary.strip(),
+            "tags": tags or {},
+            "context_json": runtime.get("context_json") or {},
+            "trigger_type": trigger_type,
+            "expires_at": build_memory_expiry(policy.get("memory_retention_days", 30)),
+            "is_active": True,
+        }
+
+        secure_supabase.table("episodic_memories").insert(row).execute()
+
+    except Exception as e:
+        print(f"Save episode failed: {e}")
+
+def fetch_recent_episodes(limit: Optional[int] = None) -> List[str]:
+    """
+    Fetch recent episodic memories for the current user and context.
+    """
+    runtime = get_runtime_context()
+    policy = get_memory_policy(runtime.get("company_id"), runtime.get("plan_code", "free"))
+
+    if not policy.get("memory_medium_enabled", False):
+        return []
+
+    fetch_limit = limit or int(policy.get("memory_retrieval_limit", 3))
+
+    try:
+        q = (
+            secure_supabase
+            .table("episodic_memories")
+            .select("summary, created_at, context_json, vertical")
+            .eq("company_id", runtime.get("company_id"))
+            .eq("user_id", runtime.get("user_id"))
+            .eq("is_active", True)
+            .order("created_at", desc=True)
+            .limit(fetch_limit)
+        )
+
+        # Keep retrieval relevant to the same vertical
+        if runtime.get("vertical"):
+            q = q.eq("vertical", runtime.get("vertical"))
+
+        rows = q.execute().data or []
+        return [r["summary"] for r in rows if r.get("summary")]
+
+    except Exception as e:
+        print(f"Fetch episodes failed: {e}")
+        return []
+
+def inject_episodic_memory(sys_prompt: str, limit: Optional[int] = None) -> str:
+    """
+    Add episodic memory notes to the system prompt.
+    """
+    episodes = fetch_recent_episodes(limit=limit)
+    if not episodes:
+        return sys_prompt
+
+    sys_prompt += "\n\nRelevant prior memory notes (use silently to personalise the response):\n"
+    for ep in episodes:
+        sys_prompt += f"- {ep}\n"
+
+    sys_prompt += "\nDo not mention these notes explicitly. Use them only to improve relevance, clarity, tone, or structure."
+    return sys_prompt
+
+def build_episode_summary(question: str, final_answer: str) -> str:
+    """
+    Very simple MVP memory note.
+    Keep it short and useful.
+    """
+    runtime = get_runtime_context()
+    vertical = runtime.get("vertical", "general")
+    ctx = runtime.get("context_json") or {}
+
+    if vertical == "education":
+        subject = ctx.get("subject") or "General"
+        topic = ctx.get("topic") or "General topic"
+        return f"{subject} / {topic}: learner needed a clear explanation with concise steps."
+
+    task_type = ctx.get("task_type") or "general task"
+    return f"{vertical}: user benefited from a concise response style for {task_type}."
+
+# --------- Admin / Observability helpers ---------
 
 def _sev_label(v: int) -> str:
     try:
@@ -719,6 +1000,20 @@ def query_openai_context(prompt, context, purpose="default", personality=None):
         )
     elif "eal" in ls_text:
         sys += " Use simple English, define key words, and give one example."
+
+    runtime = get_runtime_context()
+    policy = get_memory_policy(runtime.get("company_id"), runtime.get("plan_code", "free"))
+
+    # Short-term memory: only for consensus, only if enabled
+    if purpose == "consensus" and policy.get("memory_short_enabled", True):
+        thread_messages = fetch_recent_thread_messages(runtime.get("conversation_id"), limit=6)
+        thread_text = format_thread_memory_for_prompt(thread_messages)
+        if thread_text:
+            sys += "\n\nRecent conversation context:\n" + thread_text
+
+    # Medium-term memory: only for consensus, only if enabled
+    if purpose == "consensus" and policy.get("memory_medium_enabled", False):
+        sys = inject_episodic_memory(sys)
 
     response = openai_client.chat.completions.create(
         model=model,
@@ -1453,7 +1748,7 @@ def login_page():
             if new_name:
                 up = {"name": new_name}
                 if new_logo:
-                    key = f"logos/{uuid.uuid4()}_{new_logo.name}"
+                    key = f"logos/{uuid.uuid.uuid4()}_{new_logo.name}"
                     file_bytes = new_logo.read()
                     secure_supabase.storage.from_("company-logos").upload(key, file_bytes)
                     up["logo_url"] = secure_supabase.storage.from_("company-logos").get_public_url(key)
@@ -1578,7 +1873,7 @@ def get_or_create_embedded_user(company_id: str, external_user_id: str) -> dict 
 
     if not uid:
         # 2) Optional auto-provision (works if Users has no FK to auth.users)
-        uid = str(uuid4())
+        uid = str(uuid.uuid4())
         pseudo_email = f"embedded+{external_user_id}@local"
 
         try:
@@ -2556,6 +2851,23 @@ if is_paid:
                                 final_prompt = f"Final consensus answer based on all perspectives. Cite from: {final_sources}"
                                 final_answer, _, _ = query_openai_context(final_prompt, combined_context, purpose="consensus", personality=pers)
 
+                                turn_id = str(uuid.uuid4())
+                                st.session_state["last_turn_id"] = turn_id
+
+                                episode_summary = build_episode_summary(refined_q, final_answer)
+
+                                save_episode(
+                                    summary=episode_summary,
+                                    trigger_type="consensus_end",
+                                    tags={
+                                        "source": "final_consensus",
+                                        "agents": list(role_results.keys()),
+                                        "sources": final_sources.split(", ") if final_sources else [],
+                                        "project_id": project_id
+                                    },
+                                    turn_id=turn_id
+                                )
+
                                 post_agent_message(conv_id, "Consensus", final_answer, {
                                     "role": "consensus",
                                     "sources": final_sources.split(", ") if final_sources else []
@@ -2568,9 +2880,46 @@ if not is_paid:
     st.title("AI Platform — Start a conversation")
     st.caption("Ask a question with your public experts. No project needed.")
 
-    question = st.text_input("Ask your question:", placeholder="e.g. Why did Q2 margins dip?")
+    # --- Multi-turn chat state (MVP) ---
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []   # list of {"role": "user"/"assistant", "content": "..."}
+    if "free_turns" not in st.session_state:
+        st.session_state["free_turns"] = 0
 
-    if selected_agent_ids and st.button("Ask the question", type="primary"):
+    # --- Render chat bubbles ---
+    for m in st.session_state["messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    # --- Step 6: input box (multi-turn) ---
+    prompt = st.chat_input("Ask your question…")
+
+    if prompt:
+        # Require agent selection
+        if not selected_agent_ids:
+            st.warning("Please select at least one public agent in the sidebar.")
+            st.stop()
+
+        # Free-tier cap (use your FREE_MAX_TURNS_PER_SESSION value)
+        if st.session_state["free_turns"] >= FREE_MAX_TURNS_PER_SESSION:
+            st.warning("Free tier: you have reached the maximum turns for this session.")
+            st.stop()
+
+        # Add user message bubble
+        st.session_state["messages"].append({"role": "user", "content": prompt})
+        st.session_state["free_turns"] += 1
+
+        # Limit memory to last 8 messages
+        last8 = st.session_state["messages"][-8:]
+        thread_text = "\n".join(
+            [("User" if x["role"] == "user" else "Assistant") + ": " + x["content"] for x in last8]
+        )
+
+        # Use this as the question for your existing pipeline
+        question = prompt
+        question_with_context = f"{question}\n\nRecent conversation:\n{thread_text}"
+
+        # ✅ From here onward, keep your existing pipeline, but use question_with_context instead of question 
         # Only public agents are allowed on the free home
         allowed_ids = assert_agents_allowed(supabase, None, selected_agent_ids)
         if not allowed_ids:
@@ -2579,7 +2928,7 @@ if not is_paid:
             pers = load_user_personality(user['id'], user['company_id'])
 
                     # >>> Guardrail gatekeeper (DeRad) — ADD HERE
-            hit, derad_reply, derad_meta = run_derad_guardrail(question, personality=pers)
+            hit, derad_reply, derad_meta = run_derad_guardrail(question_with_context, personality=pers)
             if hit:
                 try:
                     log_guardrail_event(
@@ -2594,8 +2943,8 @@ if not is_paid:
                     st.warning(f"Guardrail log failed: {e}")
 
                 st.info("Safety guidance applied.")
-                st.write(derad_reply)
-                st.stop()
+                st.session_state["messages"].append({"role": "assistant", "content": derad_reply})
+                st.rerun()
 
             active_agents = [a for a in get_all_agents() if a['id'] in allowed_ids]
 
@@ -2608,7 +2957,7 @@ if not is_paid:
             for agent in active_agents:
                 hits = fetch_hits_multi(
                     agent_id=agent['id'],
-                    query_text=question,
+                    query_text=question_with_context,
                     top_k=20,
                     agent_lang=agent.get("language")  # optional if you store it
                 )
@@ -2632,10 +2981,10 @@ if not is_paid:
             default_hits = results_by_agent.get(default_agent['id'], [])
             default_titles = set(h.get("source") or "" for h in default_hits)
             default_sources = ", ".join(sorted(t for t in default_titles if t))
-            default_prompt = create_role_based_prompt("default", question, default_agent["description"], default_sources)
+            default_prompt = create_role_based_prompt("default", question_with_context, default_agent["description"], default_sources)
 
             default_summary, d_tokens, d_cost = query_agent_context(
-               question, default_prompt, personality=pers)
+                question_with_context, default_prompt, personality=pers)
             
             total_tokens += d_tokens or 0
             total_cost += d_cost or 0.0
@@ -2652,7 +3001,7 @@ if not is_paid:
                 sources = ", ".join(sorted({h.get("source") for h in hits if h.get("source")}))
                 prompt = create_role_based_prompt(
                     role,
-                    f"Question: {question}\nSummary: {default_summary}",
+                    f"Question: {question_with_context}\nSummary: {default_summary}",
                     agent["description"],
                     sources
                 )
@@ -2678,22 +3027,40 @@ if not is_paid:
             final_answer, c_tokens, c_cost = query_openai_context(
                 final_prompt, combined_context, purpose="consensus", personality=pers
             )
+
+            st.session_state["messages"].append({"role": "assistant", "content": final_answer})
+        
             total_tokens += c_tokens or 0
             total_cost += c_cost or 0.0
             step_stats.append({"step": "Consensus", "tokens": c_tokens or 0, "cost": c_cost or 0.0})
 
+            turn_id = str(uuid.uuid4())
+            st.session_state["last_turn_id"] = turn_id
+
+            episode_summary = build_episode_summary(question, final_answer)
+
+            save_episode(
+                summary=episode_summary,
+                trigger_type="consensus_end",
+                tags={
+                    "source": "final_consensus",
+                    "agents": list(role_results.keys()),
+                    "sources": final_sources.split(", ") if final_sources else []
+                },
+                turn_id=turn_id
+            )
+
             # --- PRESENTATION
-            st.success("🧠 Final AI response")
-            st.write(final_answer)
-
-            if final_sources:
-                st.markdown("**Sources:** " + " • ".join(s for s in final_sources.split(", ") if s))
-
-            # Telemetry summary
-            st.markdown("**Run details**")
-            for s in step_stats:
-                st.caption(f"{s['step']}: {s['tokens']} tokens · ${s['cost']:.4f}")
-            st.caption(f"**Total:** {total_tokens} tokens · **${total_cost:.4f}**")
+            # Optional: keep sources + run details in an expander (still visible, but not in the bubble)
+            with st.expander("Run details / sources"):
+                if final_sources:
+                    st.markdown("**Sources:** " + " • ".join(s for s in final_sources.split(", ") if s))
+                    
+            #-----------Telemetry summary ----------------------------
+                st.markdown("**Run details**")
+                for s in step_stats:
+                    st.caption(f"{s['step']}: {s['tokens']} tokens · ${s['cost']:.4f}")
+                st.caption(f"**Total:** {total_tokens} tokens · **${total_cost:.4f}**")
 
             # Save to history (inside the same button/run scope)
             try:
@@ -2708,6 +3075,9 @@ if not is_paid:
                 }).execute()
             except Exception as e:
                 st.warning(f"Could not save to history: {e}")
+
+            # Refresh UI so the new bubble appears immediately
+            st.rerun()
 
 # --------- 8. History ---------
 st.markdown("---")
@@ -2730,6 +3100,11 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
+
+
+
+
 
 
 
