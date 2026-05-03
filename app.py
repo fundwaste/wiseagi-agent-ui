@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 from datetime import datetime, timedelta
 from openai import APIStatusError
 from functools import lru_cache
-import os, re, numpy as np
+import os, re, json, numpy as np
 import tiktoken
 import uuid
 import jwt
@@ -408,6 +408,303 @@ def log_guardrail_event(
     payload = {k: v for k, v in payload.items() if v is not None}
 
     secure_supabase.table("guardrail_events").insert(payload).execute()
+
+# --------- Conversation Risk Reviewer Agent ----------------------
+
+REVIEWER_MODEL = os.getenv("REVIEWER_MODEL", "gpt-4o-mini")
+
+
+def fetch_recent_user_messages_for_review(conversation_id: str, limit: int = 12):
+    """
+    Fetches recent user messages from one conversation.
+    Used by the reviewer agent to detect gradual escalation.
+    """
+    if not conversation_id:
+        return []
+
+    try:
+        rows = (
+            secure_supabase
+            .table("mvp_messages")
+            .select("id, author_type, content, created_at")
+            .eq("conversation_id", conversation_id)
+            .eq("author_type", "user")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data or []
+        )
+
+        rows.reverse()
+        return rows
+
+    except Exception as e:
+        print(f"Risk reviewer message fetch failed: {e}")
+        return []
+
+
+def safe_json_loads(raw_text: str) -> dict:
+    """
+    Safely parses JSON returned by the reviewer model.
+    Prevents the app crashing if the model returns imperfect JSON.
+    """
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        try:
+            start = raw_text.find("{")
+            end = raw_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(raw_text[start:end])
+        except Exception:
+            pass
+
+    return {
+        "single_message_risk": 0,
+        "conversation_chain_risk": 0,
+        "trend": "unclear",
+        "risk_type": "unknown",
+        "decision": "LOG_ONLY",
+        "reason": "Reviewer JSON could not be parsed.",
+        "candidate_phrases": [],
+        "raw_output": raw_text,
+    }
+
+
+def review_conversation_risk(
+    conversation_id: str,
+    user_id: str,
+    latest_message: str,
+    latest_message_id: str | None = None,
+    company_id: str | None = None,
+):
+    """
+    Always-on reviewer agent.
+    It does not answer the user.
+    It scores the latest message and recent message chain.
+    """
+
+    recent_messages = fetch_recent_user_messages_for_review(conversation_id, limit=12)
+
+    thread_text = "\n".join([
+        f"{m.get('created_at', '')}: {m.get('content', '')}"
+        for m in recent_messages
+    ])
+
+    system_prompt = """
+You are an always-on safety reviewer for an educational and institutional AI platform.
+
+Your task is NOT to answer the user.
+Your task is to assess risk.
+
+Review:
+1. The latest message on its own.
+2. The pattern across the recent conversation.
+
+Look for:
+- gradual escalation
+- repeated probing
+- rising harmful intent
+- safeguarding concerns
+- extremist grooming
+- self-harm indicators
+- violence
+- abuse
+- exploitation
+- illegal operational requests
+- coercion
+- hate or targeted harm
+
+Return JSON only.
+
+Use this exact JSON shape:
+{
+  "single_message_risk": 0,
+  "conversation_chain_risk": 0,
+  "trend": "stable",
+  "risk_type": "unknown",
+  "decision": "ALLOW_NORMAL",
+  "reason": "Short explanation.",
+  "candidate_phrases": []
+}
+
+Risk scale:
+0 = no concern
+1 = mild concern
+2 = emerging concern
+3 = clear concern
+4 = serious or urgent concern
+
+Allowed decisions:
+ALLOW_NORMAL
+LOG_ONLY
+ADD_SAFETY_NOTE
+DERAD_ONLY
+ESCALATE_FOR_REVIEW
+"""
+
+    user_prompt = f"""
+Latest message:
+{latest_message}
+
+Recent conversation:
+{thread_text}
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=REVIEWER_MODEL,
+            temperature=0,
+            max_tokens=450,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        raw = response.choices[0].message.content.strip()
+        review = safe_json_loads(raw)
+
+    except Exception as e:
+        review = {
+            "single_message_risk": 0,
+            "conversation_chain_risk": 0,
+            "trend": "unclear",
+            "risk_type": "unknown",
+            "decision": "LOG_ONLY",
+            "reason": f"Reviewer failed safely: {e}",
+            "candidate_phrases": [],
+        }
+
+    # Normalise values
+    try:
+        single_risk = int(review.get("single_message_risk", 0))
+    except Exception:
+        single_risk = 0
+
+    try:
+        chain_risk = int(review.get("conversation_chain_risk", 0))
+    except Exception:
+        chain_risk = 0
+
+    decision = (review.get("decision") or "LOG_ONLY").upper()
+
+    if decision not in [
+        "ALLOW_NORMAL",
+        "LOG_ONLY",
+        "ADD_SAFETY_NOTE",
+        "DERAD_ONLY",
+        "ESCALATE_FOR_REVIEW",
+    ]:
+        decision = "LOG_ONLY"
+
+    # Save review to Supabase
+    try:
+        secure_supabase.table("conversation_risk_reviews").insert({
+            "company_id": company_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "message_id": latest_message_id,
+            "latest_message": (latest_message or "")[:4000],
+            "reviewed_context": (thread_text or "")[:8000],
+            "single_message_risk": single_risk,
+            "conversation_chain_risk": chain_risk,
+            "trend": review.get("trend", "unclear"),
+            "risk_type": review.get("risk_type", "unknown"),
+            "decision": decision,
+            "reason": review.get("reason", ""),
+            "reviewer_model": REVIEWER_MODEL,
+            "reviewer_raw": review,
+            "reviewed_by_human": False,
+        }).execute()
+    except Exception as e:
+        print(f"Could not save conversation risk review: {e}")
+
+    # Save candidate phrases if provided
+    try:
+        save_candidate_patterns(
+            candidates=review.get("candidate_phrases", []),
+            conversation_id=conversation_id,
+            message_id=latest_message_id,
+        )
+    except Exception as e:
+        print(f"Could not save candidate phrases: {e}")
+
+    # Make sure the returned review uses the cleaned values
+    review["decision"] = decision
+    review["single_message_risk"] = single_risk
+    review["conversation_chain_risk"] = chain_risk
+
+    return review
+
+def candidate_phrase_exists(phrase: str) -> bool:
+    """
+    Checks whether a suggested phrase already exists as a trigger or candidate.
+    """
+    phrase = (phrase or "").strip().lower()
+
+    if not phrase:
+        return True
+
+    try:
+        existing_trigger = (
+            secure_supabase
+            .table("guardrail_triggers")
+            .select("id")
+            .ilike("pattern", phrase)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+
+        if existing_trigger:
+            return True
+
+        existing_candidate = (
+            secure_supabase
+            .table("guardrail_candidate_patterns")
+            .select("id")
+            .ilike("phrase", phrase)
+            .neq("status", "rejected")
+            .limit(1)
+            .execute()
+            .data or []
+        )
+
+        return bool(existing_candidate)
+
+    except Exception as e:
+        print(f"Candidate duplicate check failed: {e}")
+        return False
+
+
+def save_candidate_patterns(candidates, conversation_id=None, message_id=None):
+    """
+    Saves possible new guardrail phrases suggested by the reviewer agent.
+    These are NOT made live automatically.
+    """
+    if not candidates:
+        return
+
+    for c in candidates:
+        phrase = (c.get("phrase") or "").strip()
+
+        if not phrase:
+            continue
+
+        if candidate_phrase_exists(phrase):
+            continue
+
+        secure_supabase.table("guardrail_candidate_patterns").insert({
+            "phrase": phrase,
+            "category": c.get("category", "unknown"),
+            "language": c.get("language", "unknown"),
+            "source_conversation_id": conversation_id,
+            "source_message_id": message_id,
+            "suggested_severity": int(c.get("suggested_severity", 1) or 1),
+            "reviewer_reason": c.get("reason", ""),
+            "status": "pending",
+        }).execute()
 
 # ---------Memory helpers----------------------
 def get_runtime_context() -> Dict[str, Any]:
@@ -864,6 +1161,7 @@ def get_guardrail_metrics_admin(days: int = 7):
         "ALLOW_NORMAL": 0,
         "ADD_DERAD_NOTE": 0,
         "DERAD_ONLY": 0,
+        "ESCALATE_FOR_REVIEW": 0,
     }
     sev_counts = {1: 0, 2: 0, 3: 0}
     lats = []
@@ -897,6 +1195,253 @@ def get_guardrail_metrics_admin(days: int = 7):
         "decision_counts": decision_counts,
         "severity_counts": sev_counts,
     }
+
+def update_candidate_pattern_status(candidate_id: str, status: str, reviewed_by: str | None = None):
+    secure_supabase.table("guardrail_candidate_patterns").update({
+        "status": status,
+        "reviewed_by": reviewed_by,
+        "reviewed_at": datetime.utcnow().isoformat(),
+    }).eq("id", candidate_id).execute()
+
+
+def approve_candidate_as_guardrail(candidate: dict, reviewed_by: str | None = None):
+    """
+    Converts a candidate phrase into a live guardrail trigger.
+    """
+    phrase = candidate.get("phrase")
+    if not phrase:
+        raise ValueError("Candidate phrase is missing.")
+
+    secure_supabase.table("guardrail_triggers").insert({
+        "pattern": phrase,
+        "match_type": "phrase",
+        "language": candidate.get("language") or "unknown",
+        "category": candidate.get("category") or "unknown",
+        "severity": int(candidate.get("suggested_severity") or 1),
+        "action": "DERAD_ONLY",
+        "is_active": True,
+        "notes": f"Added from reviewer candidate: {candidate.get('reviewer_reason', '')}",
+        "created_by": reviewed_by,
+        "updated_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+    update_candidate_pattern_status(
+        candidate_id=candidate["id"],
+        status="added_to_guardrails",
+        reviewed_by=reviewed_by,
+    )
+
+    try:
+        load_guardrail_triggers.cache_clear()
+    except Exception:
+        pass
+
+# --------- Risk Intelligence Leaderboard Helpers ----------------------
+
+def calculate_leaderboard_score(
+    trigger_count=0,
+    unique_conversations=0,
+    avg_chain_risk=0,
+    max_severity=0,
+    trend="stable",
+    escalations=0,
+):
+    score = 0
+    score += int(trigger_count or 0) * 2
+    score += int(unique_conversations or 0) * 3
+    score += float(avg_chain_risk or 0) * 10
+    score += int(max_severity or 0) * 8
+    score += int(escalations or 0) * 15
+
+    if trend == "rising":
+        score += 20
+
+    return round(score, 2)
+
+
+def get_top_guardrail_patterns(days: int = 30, limit: int = 20):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase
+        .table("guardrail_events")
+        .select("id,created_at,conversation_id,user_id,matched_patterns,max_severity,decision")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data or []
+    )
+
+    stats = {}
+
+    for r in rows:
+        patterns = r.get("matched_patterns") or []
+        for p in patterns:
+            key = (p or "").strip()
+            if not key:
+                continue
+
+            if key not in stats:
+                stats[key] = {
+                    "pattern": key,
+                    "trigger_count": 0,
+                    "conversation_ids": set(),
+                    "user_ids": set(),
+                    "max_severity": 0,
+                    "escalations": 0,
+                    "last_seen_at": r.get("created_at"),
+                    "example_event_ids": [],
+                }
+
+            stats[key]["trigger_count"] += 1
+
+            if r.get("conversation_id"):
+                stats[key]["conversation_ids"].add(r.get("conversation_id"))
+
+            if r.get("user_id"):
+                stats[key]["user_ids"].add(r.get("user_id"))
+
+            sev = int(r.get("max_severity") or 0)
+            stats[key]["max_severity"] = max(stats[key]["max_severity"], sev)
+
+            if r.get("decision") in ["DERAD_ONLY", "ESCALATE_FOR_REVIEW"]:
+                stats[key]["escalations"] += 1
+
+            if len(stats[key]["example_event_ids"]) < 5:
+                stats[key]["example_event_ids"].append(r.get("id"))
+
+    output = []
+
+    for item in stats.values():
+        unique_conversations = len(item["conversation_ids"])
+        score = calculate_leaderboard_score(
+            trigger_count=item["trigger_count"],
+            unique_conversations=unique_conversations,
+            avg_chain_risk=0,
+            max_severity=item["max_severity"],
+            trend="stable",
+            escalations=item["escalations"],
+        )
+
+        output.append({
+            "pattern": item["pattern"],
+            "trigger_count": item["trigger_count"],
+            "unique_conversation_count": unique_conversations,
+            "unique_user_count": len(item["user_ids"]),
+            "max_severity": item["max_severity"],
+            "escalations": item["escalations"],
+            "leaderboard_score": score,
+            "last_seen_at": item["last_seen_at"],
+            "example_event_ids": item["example_event_ids"],
+        })
+
+    output.sort(key=lambda x: x["leaderboard_score"], reverse=True)
+    return output[:limit]
+
+
+def get_rising_conversation_chains(days: int = 30, limit: int = 20):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase
+        .table("conversation_risk_reviews")
+        .select("id,created_at,user_id,conversation_id,message_id,single_message_risk,conversation_chain_risk,trend,risk_type,decision,reason")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data or []
+    )
+
+    by_conv = {}
+
+    for r in rows:
+        conv_id = r.get("conversation_id")
+        if not conv_id:
+            continue
+
+        if conv_id not in by_conv:
+            by_conv[conv_id] = {
+                "conversation_id": conv_id,
+                "user_id": r.get("user_id"),
+                "risk_type": r.get("risk_type"),
+                "reviews": [],
+                "max_chain_risk": 0,
+                "latest_decision": r.get("decision"),
+                "latest_reason": r.get("reason"),
+                "last_seen_at": r.get("created_at"),
+                "escalations": 0,
+            }
+
+        chain_risk = int(r.get("conversation_chain_risk") or 0)
+        by_conv[conv_id]["reviews"].append(r)
+        by_conv[conv_id]["max_chain_risk"] = max(by_conv[conv_id]["max_chain_risk"], chain_risk)
+
+        if r.get("decision") in ["DERAD_ONLY", "ESCALATE_FOR_REVIEW"]:
+            by_conv[conv_id]["escalations"] += 1
+
+    output = []
+
+    for item in by_conv.values():
+        risks = [
+            int(r.get("conversation_chain_risk") or 0)
+            for r in item["reviews"]
+        ]
+
+        avg_chain_risk = round(sum(risks) / len(risks), 2) if risks else 0
+
+        trend = "stable"
+
+        if len(risks) >= 2:
+            latest_risk = risks[0]
+            oldest_risk = risks[-1]
+
+            if latest_risk > oldest_risk:
+                trend = "rising"
+            elif latest_risk < oldest_risk:
+                trend = "falling"
+
+        score = calculate_leaderboard_score(
+            trigger_count=len(item["reviews"]),
+            unique_conversations=1,
+            avg_chain_risk=avg_chain_risk,
+            max_severity=item["max_chain_risk"],
+            trend=trend,
+            escalations=item["escalations"],
+        )
+
+        output.append({
+            "conversation_id": item["conversation_id"],
+            "user_id": item["user_id"],
+            "risk_type": item["risk_type"],
+            "review_count": len(item["reviews"]),
+            "max_chain_risk": item["max_chain_risk"],
+            "avg_chain_risk": avg_chain_risk,
+            "trend": trend,
+            "latest_decision": item["latest_decision"],
+            "latest_reason": item["latest_reason"],
+            "leaderboard_score": score,
+            "last_seen_at": item["last_seen_at"],
+        })
+
+    output.sort(key=lambda x: x["leaderboard_score"], reverse=True)
+    return output[:limit]
+
+
+def get_candidate_patterns_admin(status: str = "pending", limit: int = 100):
+    q = (
+        secure_supabase
+        .table("guardrail_candidate_patterns")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+
+    if status != "all":
+        q = q.eq("status", status)
+
+    return q.execute().data or []
 
 # ---- Model/collection registry (add more rows later) ----
 EMBED_REGISTRY = [
@@ -1620,6 +2165,29 @@ def post_user_message(conversation_id: str, user_id: str, text: str, meta: dict 
         "created_at": datetime.utcnow().isoformat(),
     }).execute().data[0]
 
+def get_or_create_free_conversation(user: dict):
+    """
+    Creates one database-backed conversation for the free chat session.
+    This allows free users to be included in conversation risk review.
+    """
+    if st.session_state.get("free_conversation_id"):
+        return st.session_state["free_conversation_id"]
+
+    conv = (
+        secure_supabase
+        .table("mvp_conversations")
+        .insert({
+            "title": "Free tier conversation",
+            "company_id": user.get("company_id"),
+            "created_by": user.get("id"),
+        })
+        .execute()
+        .data[0]
+    )
+
+    st.session_state["free_conversation_id"] = conv["id"]
+    return conv["id"]
+
 def post_agent_message(conversation_id: str, label: str, content: str, meta: dict | None = None):
     secure_supabase.table("mvp_messages").insert({
         "conversation_id": conversation_id,
@@ -1811,13 +2379,16 @@ def login_page():
 def restore_supabase_session():
     at = st.session_state.get("sb_access_token")
     rt = st.session_state.get("sb_refresh_token")
+
     if at and rt:
         try:
             supabase.auth.set_session(at, rt)
-        except Exception:
-            # Tokens expired or invalid — clear them to force a fresh login
+        except Exception as e:
+            print(f"Could not restore Supabase session: {e}")
+
             st.session_state.pop("sb_access_token", None)
             st.session_state.pop("sb_refresh_token", None)
+            st.session_state.pop("user", None)
 
 def _get_qp(name: str):
     """Read query params across Streamlit versions."""
@@ -1958,7 +2529,25 @@ def try_bootstrap_embedded_session() -> bool:
 # --- Auth bootstrap (embedded first, otherwise normal login) ---
 if not try_bootstrap_embedded_session():
     restore_supabase_session()
-    sess = supabase.auth.get_session()
+
+    try:
+        sess = supabase.auth.get_session()
+    except Exception as e:
+        print(f"Supabase session refresh failed: {e}")
+
+        st.session_state.pop("sb_access_token", None)
+        st.session_state.pop("sb_refresh_token", None)
+        st.session_state.pop("user", None)
+
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+
+        st.warning("Your session has expired. Please log in again.")
+        login_page()
+        st.stop()
+
     if not (sess and sess.user):
         st.session_state.pop("user", None)
         login_page()
@@ -2088,11 +2677,12 @@ def admin_page():
     st.title("🛠️ Admin Panel")
     st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Manage Agents",
         "Role Prompts",
         "Guardrails",
         "Guardrail Events",
+        "Risk Intelligence",
     ])
 
     # --- TAB 1: Agent Description ---
@@ -2317,10 +2907,11 @@ def admin_page():
             f"{metrics['avg_latency_ms']} ms" if metrics["avg_latency_ms"] is not None else "n/a"
         )
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         d1.metric("ALLOW_NORMAL", metrics["decision_counts"].get("ALLOW_NORMAL", 0))
         d2.metric("ADD_DERAD_NOTE", metrics["decision_counts"].get("ADD_DERAD_NOTE", 0))
         d3.metric("DERAD_ONLY", metrics["decision_counts"].get("DERAD_ONLY", 0))
+        d4.metric("ESCALATE", metrics["decision_counts"].get("ESCALATE_FOR_REVIEW", 0))
 
         s1, s2, s3 = st.columns(3)
         s1.metric("High", metrics["severity_counts"].get(3, 0))
@@ -2339,7 +2930,7 @@ def admin_page():
         ev_lang = f2.selectbox("Language", ["all", "en", "ar"], index=0, key="ev_filter_lang")
         ev_dec = f3.selectbox(
             "Decision",
-            ["all", "ALLOW_NORMAL", "ADD_DERAD_NOTE", "DERAD_ONLY"],
+            ["all", "ALLOW_NORMAL", "ADD_DERAD_NOTE", "DERAD_ONLY", "ESCALATE_FOR_REVIEW"],
             index=0,
             key="ev_filter_dec",
         )
@@ -2367,6 +2958,133 @@ def admin_page():
                         "conversation_id": r.get("conversation_id"),
                         "message_id": r.get("message_id"),
                     })
+
+    # --- TAB 5: Risk Intelligence ---
+    with tab5:
+        st.subheader("🛡 Risk Intelligence Leaderboard")
+
+        days = st.selectbox(
+            "Leaderboard window",
+            [1, 7, 14, 30],
+            index=3,
+            format_func=lambda d: f"Last {d} day(s)",
+            key="risk_lb_days"
+        )
+
+        lb_tab1, lb_tab2, lb_tab3 = st.tabs([
+            "Top Triggered Expressions",
+            "Rising Conversation Chains",
+            "Candidate New Guardrails",
+        ])
+
+        with lb_tab1:
+            st.markdown("### Top Triggered Expressions")
+
+            pattern_rows = get_top_guardrail_patterns(days=days, limit=20)
+
+            if not pattern_rows:
+                st.info("No guardrail pattern data yet.")
+            else:
+                for idx, r in enumerate(pattern_rows, start=1):
+                    with st.expander(
+                        f"#{idx} | Score {r['leaderboard_score']} | {r['pattern']}"
+                    ):
+                        st.write({
+                            "Trigger count": r["trigger_count"],
+                            "Unique conversations": r["unique_conversation_count"],
+                            "Unique users": r["unique_user_count"],
+                            "Max severity": r["max_severity"],
+                            "Escalations": r["escalations"],
+                            "Last seen": r["last_seen_at"],
+                        })
+                        st.write("Example event IDs")
+                        st.json(r["example_event_ids"])
+
+        with lb_tab2:
+            st.markdown("### Rising Conversation Chains")
+
+            chain_rows = get_rising_conversation_chains(days=days, limit=20)
+
+            if not chain_rows:
+                st.info("No conversation chain risk data yet.")
+            else:
+                for idx, r in enumerate(chain_rows, start=1):
+                    with st.expander(
+                        f"#{idx} | Score {r['leaderboard_score']} | {r['risk_type']} | {r['trend']}"
+                    ):
+                        st.write({
+                            "Conversation ID": r["conversation_id"],
+                            "User ID": r["user_id"],
+                            "Review count": r["review_count"],
+                            "Max chain risk": r["max_chain_risk"],
+                            "Average chain risk": r["avg_chain_risk"],
+                            "Latest decision": r["latest_decision"],
+                            "Last seen": r["last_seen_at"],
+                        })
+                        st.write("Reason")
+                        st.write(r["latest_reason"])
+
+        with lb_tab3:
+            st.markdown("### Candidate New Guardrails")
+
+            status_filter = st.selectbox(
+                "Status",
+                ["pending", "approved", "rejected", "added_to_guardrails", "all"],
+                index=0,
+                key="candidate_status_filter"
+            )
+
+            candidates = get_candidate_patterns_admin(status=status_filter, limit=100)
+
+            if not candidates:
+                st.info("No candidate phrases found.")
+            else:
+                for c in candidates:
+                    with st.expander(
+                        f"{c.get('phrase')} | {c.get('category')} | severity {c.get('suggested_severity')}"
+                    ):
+                        st.write("Reason")
+                        st.write(c.get("reviewer_reason") or "")
+
+                        st.write("Details")
+                        st.json({
+                            "language": c.get("language"),
+                            "status": c.get("status"),
+                            "conversation_id": c.get("source_conversation_id"),
+                            "message_id": c.get("source_message_id"),
+                            "created_at": c.get("created_at"),
+                        })
+
+                        col_a, col_b, col_c = st.columns(3)
+
+                        if col_a.button("Add to live guardrails", key=f"add_candidate_{c['id']}"):
+                            try:
+                                approve_candidate_as_guardrail(
+                                    candidate=c,
+                                    reviewed_by=user["id"] if user else None,
+                                )
+                                st.success("Candidate added to live guardrails.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+                        if col_b.button("Reject", key=f"reject_candidate_{c['id']}"):
+                            update_candidate_pattern_status(
+                                candidate_id=c["id"],
+                                status="rejected",
+                                reviewed_by=user["id"] if user else None,
+                            )
+                            st.success("Candidate rejected.")
+                            st.rerun()
+
+                        if col_c.button("Needs specialist review", key=f"specialist_candidate_{c['id']}"):
+                            update_candidate_pattern_status(
+                                candidate_id=c["id"],
+                                status="needs_specialist_review",
+                                reviewed_by=user["id"] if user else None,
+                            )
+                            st.success("Candidate marked for specialist review.")
+                            st.rerun()
 
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
@@ -2780,9 +3498,90 @@ if is_paid:
                             meta={"agents_requested": selected_agent_ids, "agents_used": list(allowed_ids)}
                         )
 
+                        # >>> Always-on Conversation Risk Reviewer
+                        try:
+                            risk_review = review_conversation_risk(
+                                conversation_id=conv_id,
+                                user_id=user["id"],
+                                latest_message=refined_q,
+                                latest_message_id=user_msg.get("id"),
+                                company_id=user.get("company_id"),
+                            )
+                        except Exception as e:
+                            risk_review = {
+                                "decision": "LOG_ONLY",
+                                "reason": f"Risk reviewer failed safely: {e}",
+                            }
+                            st.warning(f"Risk reviewer failed safely: {e}")
+
+                        review_decision = (risk_review.get("decision") or "LOG_ONLY").upper()
+
+                        safety_note = ""
+
+                        if review_decision == "ADD_SAFETY_NOTE":
+                            safety_note = (
+                                "\n\nSafety instruction: keep the response lawful, non-harmful, "
+                                "constructive, calm, and focused on safe guidance."
+                            )
+
+                            refined_q = refined_q + safety_note
+
+                        if review_decision == "ESCALATE_FOR_REVIEW":
+                            post_system_message(
+                                conv_id,
+                                "This conversation has been flagged for human safety review.",
+                                meta={"conversation_risk_review": risk_review}
+                            )
+
+                            try:
+                                log_guardrail_event(
+                                    user_id=user["id"],
+                                    question=refined_q,
+                                    meta={
+                                        "conversation_risk_review": risk_review,
+                                        "source": "project_tier",
+                                        "max_severity": risk_review.get("conversation_chain_risk", 0),
+                                    },
+                                    conversation_id=conv_id,
+                                    message_id=user_msg.get("id"),
+                                    decision="ESCALATE_FOR_REVIEW",
+                                )
+                            except Exception as e:
+                                st.warning(f"Escalation log failed: {e}")
+
+                            st.rerun()
+
+                        elif review_decision == "DERAD_ONLY":
+                            post_system_message(
+                                conv_id,
+                                "This conversation has been routed to the safety response pathway.",
+                                meta={"conversation_risk_review": risk_review}
+                            )
+
                         # >>> Guardrail gatekeeper (DeRad)
                         pers = load_user_personality(user['id'], user['company_id'])
                         hit, derad_reply, derad_meta = run_derad_guardrail(refined_q, personality=pers)
+
+                        # If the conversation reviewer decided DERAD_ONLY, force the DeRad pathway
+                        if review_decision == "DERAD_ONLY":
+                            hit = True
+                            derad_meta = {
+                                **(derad_meta or {}),
+                                "guardrail": True,
+                                "matched_patterns": derad_meta.get("matched_patterns", []) if derad_meta else [],
+                                "matched_trigger_ids": derad_meta.get("matched_trigger_ids", []) if derad_meta else [],
+                                "max_severity": max(
+                                    int(derad_meta.get("max_severity", 0)) if derad_meta else 0,
+                                    int(risk_review.get("conversation_chain_risk", 0) or 0),
+                                ),
+                                "conversation_risk_review": risk_review,
+                            }
+
+                            if not derad_reply:
+                                derad_reply = (
+                                    "I cannot help with that request. "
+                                    "I can, however, offer safe, lawful and constructive guidance."
+                                )                      
                         if hit:
 
                             # Log guardrail event (Sprint 3C)
@@ -2880,6 +3679,13 @@ if not is_paid:
     st.title("AI Platform — Start a conversation")
     st.caption("Ask a question with your public experts. No project needed.")
 
+    # --- Start a clean free-tier conversation ---
+    if st.button("➕ Start new conversation", key="start_new_free_conversation"):
+        st.session_state.pop("free_conversation_id", None)
+        st.session_state["messages"] = []
+        st.session_state["free_turns"] = 0
+        st.rerun()
+
     # --- Multi-turn chat state (MVP) ---
     if "messages" not in st.session_state:
         st.session_state["messages"] = []   # list of {"role": "user"/"assistant", "content": "..."}
@@ -2909,6 +3715,21 @@ if not is_paid:
         st.session_state["messages"].append({"role": "user", "content": prompt})
         st.session_state["free_turns"] += 1
 
+        # Create / reuse a database conversation for free chat
+        free_conv_id = get_or_create_free_conversation(user)
+
+        # Save the free user message to mvp_messages
+        free_user_msg = post_user_message(
+            conversation_id=free_conv_id,
+            user_id=user["id"],
+            text=prompt,
+            meta={
+                "source": "free_tier",
+                "free_turn": st.session_state["free_turns"],
+                "agents_requested": selected_agent_ids,
+            }
+        )
+
         # Limit memory to last 8 messages
         last8 = st.session_state["messages"][-8:]
         thread_text = "\n".join(
@@ -2918,6 +3739,67 @@ if not is_paid:
         # Use this as the question for your existing pipeline
         question = prompt
         question_with_context = f"{question}\n\nRecent conversation:\n{thread_text}"
+
+        # >>> Always-on Conversation Risk Reviewer for FREE tier
+        try:
+            risk_review = review_conversation_risk(
+                conversation_id=free_conv_id,
+                user_id=user["id"],
+                latest_message=question,
+                latest_message_id=free_user_msg.get("id"),
+                company_id=user.get("company_id"),
+            )
+        except Exception as e:
+            risk_review = {
+                "decision": "LOG_ONLY",
+                "reason": f"Free risk reviewer failed safely: {e}",
+            }
+            st.warning(f"Free risk reviewer failed safely: {e}")
+
+        review_decision = (risk_review.get("decision") or "LOG_ONLY").upper()
+
+        safety_note = ""
+
+        if review_decision == "ADD_SAFETY_NOTE":
+            safety_note = (
+                "\n\nSafety instruction: keep the response lawful, non-harmful, "
+                "constructive, calm, and focused on safe guidance."
+            )
+
+            question_with_context = question_with_context + safety_note
+
+        if review_decision == "ESCALATE_FOR_REVIEW":
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": "This conversation has been flagged for human safety review."
+            })
+
+            try:
+                post_system_message(
+                    free_conv_id,
+                    "This free-tier conversation has been flagged for human safety review.",
+                    meta={"conversation_risk_review": risk_review}
+                )
+            except Exception:
+                pass
+
+            try:
+                log_guardrail_event(
+                    user_id=user["id"] if user else None,
+                    question=question,
+                    meta={
+                        "conversation_risk_review": risk_review,
+                        "source": "free_tier",
+                        "max_severity": risk_review.get("conversation_chain_risk", 0),
+                    },
+                    conversation_id=free_conv_id,
+                    message_id=free_user_msg.get("id"),
+                    decision="ESCALATE_FOR_REVIEW",
+                )
+            except Exception as e:
+                st.warning(f"Escalation log failed: {e}")
+
+            st.rerun()
 
         # ✅ From here onward, keep your existing pipeline, but use question_with_context instead of question 
         # Only public agents are allowed on the free home
@@ -2929,14 +3811,36 @@ if not is_paid:
 
                     # >>> Guardrail gatekeeper (DeRad) — ADD HERE
             hit, derad_reply, derad_meta = run_derad_guardrail(question_with_context, personality=pers)
+
+            # If the risk reviewer decides DERAD_ONLY, force the DeRad route
+            if review_decision == "DERAD_ONLY":
+                hit = True
+                derad_meta = {
+                    **(derad_meta or {}),
+                    "guardrail": True,
+                    "matched_patterns": derad_meta.get("matched_patterns", []) if derad_meta else [],
+                    "matched_trigger_ids": derad_meta.get("matched_trigger_ids", []) if derad_meta else [],
+                    "max_severity": max(
+                        int(derad_meta.get("max_severity", 0)) if derad_meta else 0,
+                        int(risk_review.get("conversation_chain_risk", 0) or 0),
+                    ),
+                    "conversation_risk_review": risk_review,
+                    "source": "free_tier",
+                }
+
+                if not derad_reply:
+                    derad_reply = (
+                        "I cannot help with that request. "
+                        "I can, however, offer safe, lawful and constructive guidance."
+                    )
             if hit:
                 try:
                     log_guardrail_event(
                         user_id=user["id"] if user else None,
                         question=question,
                         meta=derad_meta,
-                        conversation_id=None,
-                        message_id=None,
+                        conversation_id=free_conv_id,
+                        message_id=free_user_msg.get("id"),
                         decision="DERAD_ONLY",
                     )
                 except Exception as e:
@@ -2944,6 +3848,16 @@ if not is_paid:
 
                 st.info("Safety guidance applied.")
                 st.session_state["messages"].append({"role": "assistant", "content": derad_reply})
+                
+                try:
+                    post_system_message(
+                        free_conv_id,
+                        f"[DeRad] {derad_reply}",
+                        meta=derad_meta
+                    )
+                except Exception as e:
+                    st.warning(f"Could not save free DeRad response: {e}")
+                
                 st.rerun()
 
             active_agents = [a for a in get_all_agents() if a['id'] in allowed_ids]
@@ -3100,11 +4014,6 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
-
-
-
-
-
 
 
 
