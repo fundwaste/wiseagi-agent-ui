@@ -8,11 +8,75 @@ from sentence_transformers import SentenceTransformer
 from datetime import datetime, timedelta
 from openai import APIStatusError
 from functools import lru_cache
-import os, re, json, numpy as np
+import os, re, json, numpy as np, requests
 import tiktoken
 import uuid
 import jwt
 from typing import Dict, Any, Optional, List
+import pandas as pd
+import plotly.express as px
+
+# ---------------- Page setup ----------------
+st.set_page_config(
+    page_title="WiseAGI",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ---------------- WiseAGI styling ----------------
+def apply_wiseagi_theme():
+    st.markdown("""
+    <style>
+
+    :root {
+        --navy:#102A66;
+        --navy-dark:#081A3D;
+        --blue:#2256D6;
+        --teal:#126E72;
+        --text:#232733;
+        --border:#D7DCE4;
+        --bg:#F6F8FB;
+        --surface:#FFFFFF;
+    }
+
+    .stApp {
+        background-color: var(--bg);
+    }
+
+    h1,h2,h3 {
+        color: var(--navy-dark);
+    }
+
+    section[data-testid="stSidebar"] {
+        background-color:#EEF3FA;
+        border-right:1px solid #D7DCE4;
+    }
+
+    .stButton > button {
+        border-radius:20px;
+        background-color:#2256D6;
+        color:white;
+        font-weight:bold;
+        border:none;
+    }
+
+    .stButton > button:hover {
+        background-color:#102A66;
+        color:white;
+    }
+
+    div[data-testid="stChatMessage"]{
+        background-color:white;
+        border-radius:15px;
+        padding:10px;
+        border:1px solid #e0e0e0;
+    }
+
+    </style>
+    """, unsafe_allow_html=True)
+
+apply_wiseagi_theme()
 
 # --------- 1. Setup Connections ---------
 connections.connect(
@@ -986,6 +1050,123 @@ def build_episode_summary(question: str, final_answer: str) -> str:
     return f"{vertical}: user benefited from a concise response style for {task_type}."
 
 # --------- Admin / Observability helpers ---------
+def log_dashboard_visit(page_name="admin_dashboard"):
+    try:
+        user = st.session_state.get("user") or {}
+
+        if not user.get("id"):
+            return
+
+        key = f"logged_{page_name}"
+
+        if st.session_state.get(key):
+            return
+
+        secure_supabase.table("dashboard_login_events").insert({
+            "user_id": user.get("id"),
+            "company_id": user.get("company_id"),
+            "email": user.get("email"),
+            "page_name": page_name,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+
+        st.session_state[key] = True
+
+    except Exception as e:
+        print(f"Dashboard visit log failed: {e}")
+
+log_dashboard_visit("admin_dashboard")
+
+def fetch_llm_usage_admin(days=30):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase
+        .table("llm_usage")
+        .select("*")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data or []
+    )
+
+    return pd.DataFrame(rows)
+
+def fetch_company_dashboard_analytics(days=30):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    login_rows = (
+        secure_supabase
+        .table("dashboard_login_events")
+        .select("company_id, email, created_at")
+        .gte("created_at", start_iso)
+        .execute()
+        .data or []
+    )
+
+    usage_rows = (
+        secure_supabase
+        .table("llm_usage")
+        .select("company_id, sell_price_gbp, cost_cost_gbp, created_at")
+        .gte("created_at", start_iso)
+        .execute()
+        .data or []
+    )
+
+    companies = (
+        secure_supabase
+        .table("companies")
+        .select("id, name")
+        .execute()
+        .data or []
+    )
+
+    company_map = {c["id"]: c["name"] for c in companies}
+
+    login_df = pd.DataFrame(login_rows)
+    usage_df = pd.DataFrame(usage_rows)
+
+    if not login_df.empty:
+        login_df["company_name"] = login_df["company_id"].map(company_map)
+
+    if not usage_df.empty:
+        usage_df["company_name"] = usage_df["company_id"].map(company_map)
+
+    return login_df, usage_df
+
+def fetch_guardrail_events_df(days=30):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase
+        .table("guardrail_events")
+        .select("*")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data or []
+    )
+
+    return pd.DataFrame(rows)
+
+
+def fetch_risk_reviews_df(days=30):
+    start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
+
+    rows = (
+        secure_supabase
+        .table("conversation_risk_reviews")
+        .select("*")
+        .gte("created_at", start_iso)
+        .order("created_at", desc=True)
+        .limit(5000)
+        .execute()
+        .data or []
+    )
+
+    return pd.DataFrame(rows)
 
 def _sev_label(v: int) -> str:
     try:
@@ -1622,6 +1803,44 @@ def resolve_agent_id_from_subject(subject: str | None) -> str | None:
     s = (subject or "").strip()
     return subject_map.get(s) or fallback
 
+def get_teacher_intelligence_fallback_agent_id() -> str | None:
+    """
+    Final safety fallback for embedded student mode.
+    Used when subject_agent_map and fallback_agent_id are missing.
+    Looks for a public teaching/tutor agent.
+    """
+    try:
+        rows = (
+            secure_supabase
+            .table("agents")
+            .select("id, agent_name, description, is_public")
+            .eq("is_public", True)
+            .execute()
+            .data or []
+        )
+
+        preferred_terms = [
+            "teacher intelligence",
+            "general tutor",
+            "teacher",
+            "tutor",
+            "education",
+            "learning",
+        ]
+
+        for term in preferred_terms:
+            for row in rows:
+                name = (row.get("agent_name") or "").lower()
+                desc = (row.get("description") or "").lower()
+
+                if term in name or term in desc:
+                    return row.get("id")
+
+    except Exception as e:
+        print(f"Teacher fallback lookup failed: {e}")
+
+    return None
+
 def get_qp(name: str, default=None):
     """Read a URL query param safely across Streamlit versions."""
     try:
@@ -2167,17 +2386,39 @@ def post_user_message(conversation_id: str, user_id: str, text: str, meta: dict 
 
 def get_or_create_free_conversation(user: dict):
     """
-    Creates one database-backed conversation for the free chat session.
-    This allows free users to be included in conversation risk review.
+    Creates or reuses a database-backed conversation.
+    For embedded students, reuse their latest conversation so history appears.
     """
     if st.session_state.get("free_conversation_id"):
         return st.session_state["free_conversation_id"]
+
+    is_embedded = st.session_state.get("is_embedded", False)
+
+    if is_embedded:
+        existing = (
+            secure_supabase
+            .table("mvp_conversations")
+            .select("id,title,created_at")
+            .eq("company_id", user.get("company_id"))
+            .eq("created_by", user.get("id"))
+            .eq("title", "Embedded student conversation")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+
+        if existing:
+            st.session_state["free_conversation_id"] = existing[0]["id"]
+            return existing[0]["id"]
+
+    title = "Embedded student conversation" if is_embedded else "Free tier conversation"
 
     conv = (
         secure_supabase
         .table("mvp_conversations")
         .insert({
-            "title": "Free tier conversation",
+            "title": title,
             "company_id": user.get("company_id"),
             "created_by": user.get("id"),
         })
@@ -2553,6 +2794,35 @@ if not try_bootstrap_embedded_session():
         login_page()
         st.stop()
 
+# --------- Embedded mobile styling ---------
+if st.session_state.get("is_embedded"):
+    st.markdown("""
+        <style>
+            [data-testid="stSidebar"] {
+                display: none;
+            }
+
+            [data-testid="collapsedControl"] {
+                display: none;
+            }
+
+            .block-container {
+                padding-top: 0.75rem;
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+                max-width: 100%;
+            }
+
+            h1 {
+                font-size: 1.4rem !important;
+            }
+
+            h2, h3 {
+                font-size: 1.1rem !important;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
 # --------- 4. Sidebar UI ---------
 # --- Auth guard (prevents KeyError after logout) ---
 user = st.session_state.get("user")
@@ -2587,7 +2857,18 @@ ctx = get_learning_context()
 subject = ctx.get("subject") or get_qp("subject")
 
 if subject:
-    st.session_state["active_agent_id"] = resolve_agent_id_from_subject(subject)
+    agent_id = resolve_agent_id_from_subject(subject)
+
+    # Final fallback if company settings do not contain subject mapping or fallback_agent_id
+    if not agent_id and st.session_state.get("is_embedded"):
+        agent_id = get_teacher_intelligence_fallback_agent_id()
+
+    st.session_state["active_agent_id"] = agent_id
+
+    if st.session_state.get("is_embedded"):
+        # Use DeepSeek by default for lower-cost teaching intelligence.
+        # Change to "openai" if you want OpenAI as the default.
+        st.session_state["agent_provider"] = os.getenv("EMBED_AGENT_PROVIDER", "deepseek").lower()
 
 # Pick logo (fallback to local image)
 logo_url = comp.get("logo_url") or "RABIIT.jpg"
@@ -2677,12 +2958,14 @@ def admin_page():
     st.title("🛠️ Admin Panel")
     st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Manage Agents",
-        "Role Prompts",
-        "Guardrails",
-        "Guardrail Events",
-        "Risk Intelligence",
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Manage Agents",
+    "Role Prompts",
+    "Guardrails",
+    "Guardrail Events",
+    "Risk Intelligence",
+    "Analytics Dashboard",
+    "Usage & Cost",
     ])
 
     # --- TAB 1: Agent Description ---
@@ -2893,11 +3176,19 @@ def admin_page():
 
     # --- TAB 4: Guardrail Events ---
     with tab4:
-        st.subheader("📊 Guardrail Events")
+        st.subheader("📊 Guardrail Events Dashboard")
 
-        days = st.selectbox("Window", [1, 7, 14, 30], index=1, format_func=lambda d: f"Last {d} day(s)")
+        days = st.selectbox(
+            "Window",
+            [1, 7, 14, 30],
+            index=1,
+            format_func=lambda d: f"Last {d} day(s)",
+            key="guardrail_events_window"
+        )
+
         metrics = get_guardrail_metrics_admin(days=days)
 
+        # ---------------- KPI Cards ----------------
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Checks", metrics["total_checks"])
         m2.metric("Triggered", metrics["triggered"])
@@ -2908,34 +3199,132 @@ def admin_page():
         )
 
         d1, d2, d3, d4 = st.columns(4)
-        d1.metric("ALLOW_NORMAL", metrics["decision_counts"].get("ALLOW_NORMAL", 0))
-        d2.metric("ADD_DERAD_NOTE", metrics["decision_counts"].get("ADD_DERAD_NOTE", 0))
-        d3.metric("DERAD_ONLY", metrics["decision_counts"].get("DERAD_ONLY", 0))
-        d4.metric("ESCALATE", metrics["decision_counts"].get("ESCALATE_FOR_REVIEW", 0))
+        d1.metric("Allow Normal", metrics["decision_counts"].get("ALLOW_NORMAL", 0))
+        d2.metric(
+            "Safety Note",
+            metrics["decision_counts"].get("ADD_DERAD_NOTE", 0)
+            + metrics["decision_counts"].get("ADD_SAFETY_NOTE", 0)
+        )
+        d3.metric("DeRad Only", metrics["decision_counts"].get("DERAD_ONLY", 0))
+        d4.metric("Escalate", metrics["decision_counts"].get("ESCALATE_FOR_REVIEW", 0))
 
         s1, s2, s3 = st.columns(3)
-        s1.metric("High", metrics["severity_counts"].get(3, 0))
-        s2.metric("Medium", metrics["severity_counts"].get(2, 0))
-        s3.metric("Low", metrics["severity_counts"].get(1, 0))
+        s1.metric("High Severity", metrics["severity_counts"].get(3, 0))
+        s2.metric("Medium Severity", metrics["severity_counts"].get(2, 0))
+        s3.metric("Low Severity", metrics["severity_counts"].get(1, 0))
 
         st.markdown("---")
+
+        # ---------------- Visual Dashboard ----------------
+        st.markdown("### 📈 Visual Summary")
+
+        chart_rows = list_guardrail_events_admin(
+            limit=1000,
+            severity="all",
+            language="all",
+            decision="all"
+        )
+
+        if chart_rows:
+            chart_df = pd.DataFrame(chart_rows)
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if "decision" in chart_df.columns:
+                    decision_df = (
+                        chart_df.groupby("decision")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.pie(
+                        decision_df,
+                        names="decision",
+                        values="count",
+                        title="Decision Breakdown"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                if "max_severity" in chart_df.columns:
+                    severity_df = (
+                        chart_df.groupby("max_severity")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.bar(
+                        severity_df,
+                        x="max_severity",
+                        y="count",
+                        title="Events by Severity"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            if "created_at" in chart_df.columns:
+                chart_df["date"] = pd.to_datetime(chart_df["created_at"]).dt.date
+
+                daily_df = (
+                    chart_df.groupby("date")
+                    .size()
+                    .reset_index(name="events")
+                )
+
+                fig = px.line(
+                    daily_df,
+                    x="date",
+                    y="events",
+                    title="Guardrail Events Over Time"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info("No chart data available yet.")
+
+        st.markdown("---")
+
+        # ---------------- Filters ----------------
+        st.markdown("### 🔎 Event Filters")
+
         f1, f2, f3 = st.columns(3)
+
         ev_sev = f1.selectbox(
             "Severity",
             ["all", "3", "2", "1"],
             index=0,
             key="ev_filter_sev",
-            format_func=lambda x: {"all": "all", "1": "low", "2": "medium", "3": "high"}.get(x, x),
+            format_func=lambda x: {
+                "all": "all",
+                "1": "low",
+                "2": "medium",
+                "3": "high"
+            }.get(x, x),
         )
-        ev_lang = f2.selectbox("Language", ["all", "en", "ar"], index=0, key="ev_filter_lang")
+
+        ev_lang = f2.selectbox(
+            "Language",
+            ["all", "en", "ar"],
+            index=0,
+            key="ev_filter_lang"
+        )
+
         ev_dec = f3.selectbox(
             "Decision",
-            ["all", "ALLOW_NORMAL", "ADD_DERAD_NOTE", "DERAD_ONLY", "ESCALATE_FOR_REVIEW"],
+            ["all", "ALLOW_NORMAL", "ADD_DERAD_NOTE", "ADD_SAFETY_NOTE", "DERAD_ONLY", "ESCALATE_FOR_REVIEW"],
             index=0,
             key="ev_filter_dec",
         )
 
-        rows = list_guardrail_events_admin(limit=200, severity=ev_sev, language=ev_lang, decision=ev_dec)
+        rows = list_guardrail_events_admin(
+            limit=200,
+            severity=ev_sev,
+            language=ev_lang,
+            decision=ev_dec
+        )
+
+        # ---------------- Event Log ----------------
+        st.markdown("### 📄 Event Log")
 
         if not rows:
             st.info("No events found.")
@@ -2945,13 +3334,21 @@ def admin_page():
                 sev = _sev_label(r.get("max_severity"))
                 lang = r.get("language") or "-"
                 decision = r.get("decision") or "UNKNOWN"
+
                 with st.expander(f"{ts} | {decision} | {sev} | {lang}"):
                     st.write("**Input**")
                     st.write(r.get("input_text") or "")
+
                     st.write("**Matched patterns**")
                     st.json(r.get("matched_patterns") or [])
+
                     st.write("**Latency**")
-                    st.write(f"{r.get('latency_ms')} ms" if r.get("latency_ms") is not None else "n/a")
+                    st.write(
+                        f"{r.get('latency_ms')} ms"
+                        if r.get("latency_ms") is not None
+                        else "n/a"
+                    )
+
                     st.write("**IDs**")
                     st.write({
                         "user_id": r.get("user_id"),
@@ -3086,12 +3483,333 @@ def admin_page():
                             st.success("Candidate marked for specialist review.")
                             st.rerun()
 
+  # --- TAB 6: Analytics Dashboard ---
+    with tab6:
+        st.subheader("📊 Analytics Dashboard")
+
+        days = st.selectbox(
+            "Time period",
+            [7, 14, 30, 90],
+            index=2,
+            key="analytics_days"
+        )
+
+        usage_df = fetch_llm_usage_admin(days)
+        guard_df = fetch_guardrail_events_df(days)
+        risk_df = fetch_risk_reviews_df(days)
+
+        login_df, company_usage_df = fetch_company_dashboard_analytics(days)
+
+        # ---------------- Main KPI Cards ----------------
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("LLM Calls", len(usage_df))
+        c2.metric("Guardrail Events", len(guard_df))
+        c3.metric("Risk Reviews", len(risk_df))
+
+        total_revenue = (
+            usage_df["sell_price_gbp"].sum()
+            if not usage_df.empty and "sell_price_gbp" in usage_df
+            else 0
+        )
+
+        c4.metric("Estimated Revenue", f"£{total_revenue:.4f}")
+
+        st.markdown("---")
+
+        # ---------------- Company Dashboard Usage ----------------
+        st.markdown("### 🏢 Company Dashboard Usage")
+
+        d1, d2, d3, d4 = st.columns(4)
+
+        total_logins = len(login_df) if not login_df.empty else 0
+
+        active_companies = (
+            login_df["company_id"].nunique()
+            if not login_df.empty and "company_id" in login_df
+            else 0
+        )
+
+        total_provider_cost = (
+            company_usage_df["cost_cost_gbp"].sum()
+            if not company_usage_df.empty and "cost_cost_gbp" in company_usage_df
+            else 0
+        )
+
+        total_company_revenue = (
+            company_usage_df["sell_price_gbp"].sum()
+            if not company_usage_df.empty and "sell_price_gbp" in company_usage_df
+            else 0
+        )
+
+        d1.metric("Dashboard Visits", total_logins)
+        d2.metric("Active Companies", active_companies)
+        d3.metric("LLM Cost Incurred", f"£{total_provider_cost:.4f}")
+        d4.metric("Company Revenue", f"£{total_company_revenue:.4f}")
+
+        if not login_df.empty and "company_name" in login_df:
+            company_logins = (
+                login_df.groupby("company_name")
+                .size()
+                .reset_index(name="dashboard_visits")
+                .sort_values("dashboard_visits", ascending=False)
+            )
+
+            fig = px.bar(
+                company_logins,
+                x="company_name",
+                y="dashboard_visits",
+                title="Dashboard Visits by Company"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        if not company_usage_df.empty and "company_name" in company_usage_df:
+            company_cost = (
+                company_usage_df
+                .groupby("company_name")[["cost_cost_gbp", "sell_price_gbp"]]
+                .sum()
+                .reset_index()
+                .sort_values("cost_cost_gbp", ascending=False)
+            )
+
+            col_cost, col_revenue = st.columns(2)
+
+            with col_cost:
+                fig = px.bar(
+                    company_cost,
+                    x="company_name",
+                    y="cost_cost_gbp",
+                    title="Usage Cost Incurred by Company"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with col_revenue:
+                fig = px.bar(
+                    company_cost,
+                    x="company_name",
+                    y="sell_price_gbp",
+                    title="Recharge / Revenue by Company"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("#### Company Cost Summary")
+            st.dataframe(company_cost, use_container_width=True)
+
+        st.markdown("---")
+
+        # ---------------- Platform Usage Trend ----------------
+        st.markdown("### 📈 Platform Usage Trend")
+
+        if not usage_df.empty and "created_at" in usage_df:
+            usage_df["date"] = pd.to_datetime(usage_df["created_at"]).dt.date
+
+            daily_usage = (
+                usage_df.groupby("date")
+                .size()
+                .reset_index(name="LLM Calls")
+            )
+
+            fig = px.bar(
+                daily_usage,
+                x="date",
+                y="LLM Calls",
+                title="Daily Platform Usage"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No platform usage data found for this period.")
+
+        st.markdown("---")
+
+        # ---------------- Provider / Model Split ----------------
+        st.markdown("### 🤖 Provider and Model Usage")
+
+        if not usage_df.empty:
+            col_provider, col_model = st.columns(2)
+
+            with col_provider:
+                if "provider" in usage_df:
+                    provider_df = (
+                        usage_df.groupby("provider")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.pie(
+                        provider_df,
+                        names="provider",
+                        values="count",
+                        title="Usage by Provider"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col_model:
+                if "model" in usage_df:
+                    model_df = (
+                        usage_df.groupby("model")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.bar(
+                        model_df,
+                        x="model",
+                        y="count",
+                        title="Usage by Model"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No provider or model usage data found.")
+
+        st.markdown("---")
+
+        # ---------------- Safety Overview ----------------
+        st.markdown("### 🛡️ Safety Overview")
+
+        if not guard_df.empty:
+            col_decision, col_severity = st.columns(2)
+
+            with col_decision:
+                if "decision" in guard_df:
+                    decision_df = (
+                        guard_df.groupby("decision")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.pie(
+                        decision_df,
+                        names="decision",
+                        values="count",
+                        title="Guardrail Decisions"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col_severity:
+                if "max_severity" in guard_df:
+                    severity_df = (
+                        guard_df.groupby("max_severity")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.bar(
+                        severity_df,
+                        x="max_severity",
+                        y="count",
+                        title="Guardrail Severity"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No guardrail data found for this period.")
+
+        st.markdown("---")
+
+        # ---------------- Risk Overview ----------------
+        st.markdown("### ⚠️ Risk Review Overview")
+
+        if not risk_df.empty:
+            col_risk_type, col_risk_decision = st.columns(2)
+
+            with col_risk_type:
+                if "risk_type" in risk_df:
+                    risk_type_df = (
+                        risk_df.groupby("risk_type")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.bar(
+                        risk_type_df,
+                        x="risk_type",
+                        y="count",
+                        title="Risk Types Detected"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col_risk_decision:
+                if "decision" in risk_df:
+                    risk_decision_df = (
+                        risk_df.groupby("decision")
+                        .size()
+                        .reset_index(name="count")
+                    )
+
+                    fig = px.pie(
+                        risk_decision_df,
+                        names="decision",
+                        values="count",
+                        title="Risk Reviewer Decisions"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No risk review data found for this period.")
+            
+  # --- TAB 7: Risk Intelligence ---
+    with tab7:
+        st.subheader("💷 Usage & Cost")
+
+        usage_df = fetch_llm_usage_admin(days)
+
+        if usage_df.empty:
+            st.info("No usage data found.")
+        else:
+            if "model" in usage_df and "sell_price_gbp" in usage_df:
+                model_cost = usage_df.groupby("model")["sell_price_gbp"].sum().reset_index()
+
+                fig = px.bar(model_cost, x="model", y="sell_price_gbp", title="Revenue by Model")
+                st.plotly_chart(fig, use_container_width=True)
+
+            if "provider" in usage_df:
+                provider_counts = usage_df.groupby("provider").size().reset_index(name="count")
+
+                fig = px.pie(provider_counts, names="provider", values="count", title="Usage by Provider")
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(usage_df, use_container_width=True)
+
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
         admin_page()
         st.stop()
 
 st.sidebar.markdown("---")
+
+billing_status = st.query_params.get("billing")
+billing_plan = st.query_params.get("plan")
+
+if billing_status == "success" and billing_plan in ["pro", "team", "enterprise"]:
+    secure_supabase.table("Users").update({
+        "plan": billing_plan
+    }).eq("id", user["id"]).execute()
+
+    st.success(f"Payment successful. Your plan is now {billing_plan.title()}.")
+    st.query_params.clear()
+    st.rerun()
+
+elif billing_status == "cancelled":
+    st.warning("Payment cancelled.")
+    st.query_params.clear()
+
+def start_stripe_checkout(user, plan_code: str, price_id: str):
+    billing_api_url = os.getenv("BILLING_API_URL", "http://localhost:8001")
+
+    res = requests.post(
+        f"{billing_api_url}/api/billing/create-checkout-session",
+        json={
+            "user_id": user["id"],
+            "email": user.get("email"),
+            "plan_code": plan_code,
+            "price_id": price_id,
+        },
+        timeout=20,
+    )
+
+    if not res.ok:
+        st.error(f"Billing server returned an error: {res.text}")
+        st.stop()
+
+    return res.json()["url"]
 
 # ---- Plan helper (top-level helpers area is fine) ----
 def get_user_plan(user_id):
@@ -3100,14 +3818,28 @@ def get_user_plan(user_id):
 
 # --- Plan & upgrade ---
 plan = get_user_plan(user["id"]).lower()
-is_paid = plan in ("team", "enterprise")
+is_paid = plan in ("pro", "team", "enterprise")
+has_projects = plan in ("team", "enterprise")
+
 st.sidebar.caption(f"Plan: {plan.title()}")
 
-# Show upgrade CTAs only when on Free
-if not is_paid:
-    st.sidebar.info("Projects are available on paid plans.")
-    st.sidebar.link_button("Upgrade to Team", os.getenv("STRIPE_TEAM_LINK", "#"))
-    st.sidebar.link_button("Upgrade to Enterprise", os.getenv("STRIPE_ENT_LINK", "#"))
+if plan == "free":
+    st.sidebar.info("Upgrade to unlock more usage and paid features.")
+
+    if st.sidebar.button("Upgrade to Pro"):
+        checkout_url = start_stripe_checkout(user, "pro", os.getenv("STRIPE_PRO_PRICE_ID"))
+        st.sidebar.success("Stripe checkout is ready.")
+        st.sidebar.link_button("Continue to secure Stripe payment", checkout_url)
+
+    if st.sidebar.button("Upgrade to Team"):
+        checkout_url = start_stripe_checkout(user, "team", os.getenv("STRIPE_TEAM_PRICE_ID"))
+        st.sidebar.success("Stripe checkout is ready.")
+        st.sidebar.link_button("Continue to secure Stripe payment", checkout_url)
+
+    if st.sidebar.button("Upgrade to Enterprise"):
+        checkout_url = start_stripe_checkout(user, "enterprise", os.getenv("STRIPE_ENTERPRISE_PRICE_ID"))
+        st.sidebar.success("Stripe checkout is ready.")
+        st.sidebar.link_button("Continue to secure Stripe payment", checkout_url)
 
 # ---- Developer test (temporary) ----
 # Show plan toggles on ALL plans, but only for admins (or set DEV_MODE=1 to always show)
@@ -3676,21 +4408,68 @@ if is_paid:
 if not is_paid:
 
     # FREE HOME
-    st.title("AI Platform — Start a conversation")
-    st.caption("Ask a question with your public experts. No project needed.")
+    if st.session_state.get("is_embedded"):
+        ctx = get_learning_context()
+        subject = ctx.get("subject") or "Learning"
+        topic = ctx.get("topic") or ""
+
+        st.markdown(f"### Ask WiseAGI — {subject}")
+        if topic:
+            st.caption(f"Topic: {topic}")
+    else:
+        st.title("AI Platform — Start a conversation")
+        st.caption("Ask a question with your public experts. No project needed.")
 
     # --- Start a clean free-tier conversation ---
-    if st.button("➕ Start new conversation", key="start_new_free_conversation"):
-        st.session_state.pop("free_conversation_id", None)
-        st.session_state["messages"] = []
-        st.session_state["free_turns"] = 0
-        st.rerun()
+    if not st.session_state.get("is_embedded"):
+        if st.button("➕ Start new conversation", key="start_new_free_conversation"):
+            st.session_state.pop("free_conversation_id", None)
+            st.session_state["messages"] = []
+            st.session_state["free_turns"] = 0
+            st.rerun()
 
     # --- Multi-turn chat state (MVP) ---
     if "messages" not in st.session_state:
         st.session_state["messages"] = []   # list of {"role": "user"/"assistant", "content": "..."}
     if "free_turns" not in st.session_state:
         st.session_state["free_turns"] = 0
+
+    # --- Embedded mode: create/reuse conversation and load previous history ---
+    free_conv_id = None
+
+    if st.session_state.get("is_embedded"):
+        free_conv_id = get_or_create_free_conversation(user)
+
+        if not st.session_state.get("embedded_history_loaded"):
+            previous_messages = list_messages(free_conv_id, limit=50)
+
+            st.session_state["messages"] = []
+
+            for msg in previous_messages:
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    continue
+
+                if msg.get("author_type") == "user":
+                    st.session_state["messages"].append({
+                        "role": "user",
+                        "content": content,
+                    })
+
+                elif msg.get("author_type") in ["agent", "system"]:
+                    clean_content = content
+
+                    if clean_content.startswith("[Consensus]"):
+                        clean_content = clean_content.replace("[Consensus]", "").strip()
+                    elif clean_content.startswith("[DeRad]"):
+                        clean_content = clean_content.replace("[DeRad]", "").strip()
+
+                    st.session_state["messages"].append({
+                        "role": "assistant",
+                        "content": clean_content,
+                    })
+
+            st.session_state["embedded_history_loaded"] = True
 
     # --- Render chat bubbles ---
     for m in st.session_state["messages"]:
@@ -3702,8 +4481,12 @@ if not is_paid:
 
     if prompt:
         # Require agent selection
+        if st.session_state.get("is_embedded"):
+            embedded_agent_id = st.session_state.get("active_agent_id")
+            selected_agent_ids = [embedded_agent_id] if embedded_agent_id else []
+
         if not selected_agent_ids:
-            st.warning("Please select at least one public agent in the sidebar.")
+            st.warning("No tutor is currently configured for this subject.")
             st.stop()
 
         # Free-tier cap (use your FREE_MAX_TURNS_PER_SESSION value)
@@ -3716,7 +4499,8 @@ if not is_paid:
         st.session_state["free_turns"] += 1
 
         # Create / reuse a database conversation for free chat
-        free_conv_id = get_or_create_free_conversation(user)
+        if not free_conv_id:
+            free_conv_id = get_or_create_free_conversation(user)
 
         # Save the free user message to mvp_messages
         free_user_msg = post_user_message(
@@ -3724,9 +4508,10 @@ if not is_paid:
             user_id=user["id"],
             text=prompt,
             meta={
-                "source": "free_tier",
+                "source": "embedded" if st.session_state.get("is_embedded") else "free_tier",
                 "free_turn": st.session_state["free_turns"],
                 "agents_requested": selected_agent_ids,
+                "learning_context": get_learning_context(),
             }
         )
 
@@ -4014,6 +4799,14 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
+
+
+
+
+
+
+
 
 
 
