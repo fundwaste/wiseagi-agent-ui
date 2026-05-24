@@ -3244,7 +3244,7 @@ def admin_page():
                         values="count",
                         title="Decision Breakdown"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab4_chart_1")
 
             with c2:
                 if "max_severity" in chart_df.columns:
@@ -3260,7 +3260,7 @@ def admin_page():
                         y="count",
                         title="Events by Severity"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab4_chart_2")
 
             if "created_at" in chart_df.columns:
                 chart_df["date"] = pd.to_datetime(chart_df["created_at"]).dt.date
@@ -3277,7 +3277,7 @@ def admin_page():
                     y="events",
                     title="Guardrail Events Over Time"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="tab4_chart_3")
 
         else:
             st.info("No chart data available yet.")
@@ -3561,7 +3561,7 @@ def admin_page():
                 y="dashboard_visits",
                 title="Dashboard Visits by Company"
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="tab6_chart_1")
 
         if not company_usage_df.empty and "company_name" in company_usage_df:
             company_cost = (
@@ -3581,7 +3581,7 @@ def admin_page():
                     y="cost_cost_gbp",
                     title="Usage Cost Incurred by Company"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="tab6_chart_2")
 
             with col_revenue:
                 fig = px.bar(
@@ -3590,7 +3590,7 @@ def admin_page():
                     y="sell_price_gbp",
                     title="Recharge / Revenue by Company"
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="tab6_chart_3")
 
             st.markdown("#### Company Cost Summary")
             st.dataframe(company_cost, use_container_width=True)
@@ -3615,7 +3615,7 @@ def admin_page():
                 y="LLM Calls",
                 title="Daily Platform Usage"
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="tab6_chart_4")
         else:
             st.info("No platform usage data found for this period.")
 
@@ -3641,7 +3641,7 @@ def admin_page():
                         values="count",
                         title="Usage by Provider"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_5")
 
             with col_model:
                 if "model" in usage_df:
@@ -3657,7 +3657,7 @@ def admin_page():
                         y="count",
                         title="Usage by Model"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_6")
         else:
             st.info("No provider or model usage data found.")
 
@@ -3683,7 +3683,7 @@ def admin_page():
                         values="count",
                         title="Guardrail Decisions"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_7")
 
             with col_severity:
                 if "max_severity" in guard_df:
@@ -3699,7 +3699,7 @@ def admin_page():
                         y="count",
                         title="Guardrail Severity"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_8")
         else:
             st.info("No guardrail data found for this period.")
 
@@ -3725,7 +3725,7 @@ def admin_page():
                         y="count",
                         title="Risk Types Detected"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_9")
 
             with col_risk_decision:
                 if "decision" in risk_df:
@@ -3741,10 +3741,10 @@ def admin_page():
                         values="count",
                         title="Risk Reviewer Decisions"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="tab6_chart_10")
         else:
             st.info("No risk review data found for this period.")
-            
+
   # --- TAB 7: Risk Intelligence ---
     with tab7:
         st.subheader("💷 Usage & Cost")
@@ -4799,6 +4799,7 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
 
 
 
