@@ -1508,6 +1508,67 @@ def fetch_guardrail_events_df(days=30):
 
     return pd.DataFrame(rows)
 
+def fetch_training_examples_for_review(limit=20, signal_filter="all"):
+    q = (
+        secure_supabase
+        .table("signal_training_examples")
+        .select("""
+            id,
+            text,
+            dataset_category,
+            mapped_route,
+            review_status,
+            created_at,
+            signal_id,
+            signals_catalogue (
+                signal_name
+            )
+        """)
+        .eq("review_status", "pending")
+        .order("created_at", desc=False)
+        .limit(limit)
+    )
+
+    if signal_filter != "all":
+        q = q.eq("signal_id", signal_filter)
+
+    return q.execute().data or []
+
+
+def fetch_signals_for_dropdown():
+    rows = (
+        secure_supabase
+        .table("signals_catalogue")
+        .select("id, signal_name")
+        .eq("active", True)
+        .order("signal_name")
+        .execute()
+        .data or []
+    )
+    return rows
+
+
+def save_signal_reviewer_feedback(
+    training_example_id,
+    original_signal_id,
+    reviewer_signal_id,
+    reviewer_confidence,
+    reviewer_notes,
+    reviewer_id=None,
+):
+    secure_supabase.table("signal_reviewer_feedback").insert({
+        "training_example_id": training_example_id,
+        "original_signal_id": original_signal_id,
+        "reviewer_signal_id": reviewer_signal_id,
+        "reviewer_confidence": reviewer_confidence,
+        "reviewer_notes": reviewer_notes,
+        "reviewer_id": reviewer_id,
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+    secure_supabase.table("signal_training_examples").update({
+        "review_status": "reviewed"
+    }).eq("id", training_example_id).execute()
 
 def fetch_risk_reviews_df(days=30):
     start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -3315,7 +3376,7 @@ def admin_page():
     st.title("🛠️ Admin Panel")
     st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "Manage Agents",
     "Role Prompts",
     "Guardrails",
@@ -3324,6 +3385,7 @@ def admin_page():
     "Analytics Dashboard",
     "Usage & Cost",
     "Human Signals",
+    "Safety Signals Reviewer",
     ])
 
     # --- TAB 1: Agent Description ---
@@ -4201,6 +4263,91 @@ def admin_page():
 
             st.markdown("### Signal Log")
             st.dataframe(signal_df, use_container_width=True)
+
+    with tab9:
+        st.subheader("🧠 Safety Signal Reviewer")
+
+        st.caption("Review dataset examples and confirm or correct the mapped signal.")
+
+        signals = fetch_signals_for_dropdown()
+
+        signal_options = {"all": "All signals"}
+        signal_options.update({
+            s["id"]: s["signal_name"]
+            for s in signals
+        })
+
+        selected_signal = st.selectbox(
+            "Filter by signal",
+            options=list(signal_options.keys()),
+            format_func=lambda x: signal_options[x],
+            key="review_signal_filter"
+        )
+
+        examples = fetch_training_examples_for_review(
+            limit=10,
+            signal_filter=selected_signal
+        )
+
+        if not examples:
+            st.info("No pending training examples found.")
+        else:
+            for ex in examples:
+                current_signal = (ex.get("signals_catalogue") or {}).get("signal_name", "Unknown")
+
+                with st.expander(f"{current_signal} | {ex.get('mapped_route')} | {ex.get('dataset_category')}"):
+                    st.write("**Training text**")
+                    st.write(ex.get("text"))
+
+                    st.write("**Current mapped signal**")
+                    st.code(current_signal)
+
+                    reviewer_signal_id = st.selectbox(
+                        "Reviewer signal",
+                        options=[s["id"] for s in signals],
+                        format_func=lambda sid: next(
+                            (s["signal_name"] for s in signals if s["id"] == sid),
+                            sid
+                        ),
+                        index=max(
+                            0,
+                            [s["id"] for s in signals].index(ex["signal_id"])
+                            if ex.get("signal_id") in [s["id"] for s in signals]
+                            else 0
+                        ),
+                        key=f"reviewer_signal_{ex['id']}"
+                    )
+
+                    reviewer_confidence = st.slider(
+                        "Reviewer confidence",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=0.8,
+                        step=0.05,
+                        key=f"confidence_{ex['id']}"
+                    )
+
+                    reviewer_notes = st.text_area(
+                        "Reviewer notes",
+                        key=f"notes_{ex['id']}"
+                    )
+
+                    if st.button("Save review", key=f"save_review_{ex['id']}"):
+                        reviewer_id = None
+                        if st.session_state.get("user"):
+                            reviewer_id = st.session_state["user"].get("id")
+
+                        save_signal_reviewer_feedback(
+                            training_example_id=ex["id"],
+                            original_signal_id=ex["signal_id"],
+                            reviewer_signal_id=reviewer_signal_id,
+                            reviewer_confidence=reviewer_confidence,
+                            reviewer_notes=reviewer_notes,
+                            reviewer_id=reviewer_id,
+                        )
+
+                        st.success("Review saved.")
+                        st.rerun()
 
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
@@ -5350,6 +5497,7 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
 
 
 
