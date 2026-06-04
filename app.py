@@ -18,7 +18,7 @@ import plotly.express as px
 
 # ---------------- Page setup ----------------
 st.set_page_config(
-    page_title="WiseAGI",
+    page_title="Human Intelligence Platform",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -534,7 +534,172 @@ def safe_json_loads(raw_text: str) -> dict:
         "raw_output": raw_text,
     }
 
+def classify_human_signal(latest_message: str, conversation_history: str = "") -> dict:
+    """
+    Hidden classifier. It does not answer the user.
+    It decides the human signal, route, confidence and review queue.
+    """
 
+    system_prompt = """
+You are the WiseAGI Human Signals Classifier.
+
+Your job is NOT to answer the user.
+Your job is to classify the human signals present in the latest message and recent conversation.
+
+Return JSON only.
+
+Allowed routes:
+NORMAL
+SOFT_SUPPORT
+ELEVATED_REVIEW
+CRITICAL_SAFETY
+
+Allowed domains:
+none
+wellbeing
+bullying_respect
+child_protection
+counter_extremism
+digital_safety
+workplace_behaviour
+
+Allowed signals:
+none
+isolation
+low_belonging
+stress
+anxiety
+emotional_distress
+burnout
+disengagement
+bullying
+harassment
+exclusion
+discrimination
+abuse
+grooming
+exploitation
+safeguarding_concern
+extremism
+recruitment
+radicalisation
+violence
+prompt_injection
+privacy_risk
+cyber_risk
+unsafe_ai_use
+
+Return this exact JSON shape:
+{
+  "route": "NORMAL",
+  "domain": "none",
+  "primary_signal": "none",
+  "secondary_signal": "none",
+  "confidence": 0.0,
+  "severity": 0,
+  "trend": "stable",
+  "review_required": false,
+  "review_queue": "none",
+  "reason": "Short explanation."
+}
+"""
+
+    user_prompt = f"""
+Latest message:
+{latest_message}
+
+Recent conversation:
+{conversation_history}
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=REVIEWER_MODEL,
+            temperature=0,
+            max_tokens=350,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        raw = response.choices[0].message.content.strip()
+        classification = safe_json_loads(raw)
+
+    except Exception as e:
+        classification = {
+            "route": "NORMAL",
+            "domain": "none",
+            "primary_signal": "none",
+            "secondary_signal": "none",
+            "confidence": 0.0,
+            "severity": 0,
+            "trend": "stable",
+            "review_required": False,
+            "review_queue": "none",
+            "reason": f"Classifier failed safely: {e}",
+        }
+
+    return classification
+
+def run_support_guidance_agent(question, classification):
+    route = classification.get("route", "SOFT_SUPPORT")
+    signal = classification.get("primary_signal", "")
+    reason = classification.get("reason", "")
+
+    system_prompt = f"""
+You are the WiseAGI Support & Guidance Agent.
+
+Route: {route}
+Primary Signal: {signal}
+Reason: {reason}
+
+You respond like a calm, caring support worker.
+
+Always follow this order:
+1. Acknowledge the emotion.
+2. Validate the feeling.
+3. Reassure the user they are not alone.
+4. Offer one practical safety step.
+5. Ask one or two gentle follow-up questions.
+
+Important style rules:
+- Start with empathy, not explanation.
+- Do not sound like a teacher.
+- Do not sound like a policy document.
+- Do not give a long list immediately.
+- Speak directly to the user using "you".
+- Keep the first response short and human.
+- Tell the user they can continue talking to you here if that feels easier.
+- Do not mention guardrails, risk scores, classifiers, or human review.
+
+If the user may be in immediate danger:
+- Tell them their safety is the most important thing right now.
+- Suggest moving towards a busy public place, trusted adult, shop, neighbour, reception desk, teacher, manager, or local support point.
+- Encourage emergency help if they believe they are in immediate danger.
+
+For bullying, fear, pressure, abuse, coercion, grooming, or safeguarding:
+- Tell the user they do not deserve this.
+- Encourage trusted human support.
+- Ask: "Are you safe right now?"
+- Ask: "Is this happening today or has it happened before?"
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.4,
+            max_tokens=260,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        return f"Support & Guidance Agent error: {e}"
+    
 def review_conversation_risk(
     conversation_id: str,
     user_id: str,
@@ -699,6 +864,77 @@ Recent conversation:
     review["single_message_risk"] = single_risk
     review["conversation_chain_risk"] = chain_risk
 
+    risk_type = (review.get("risk_type") or "").lower()
+    reason = (review.get("reason") or "").lower()
+    latest_text = (latest_message or "").lower()
+
+    combined_text = f"{risk_type} {reason} {latest_text}"
+
+    signal_name = None
+
+    if any(word in combined_text for word in ["isolated", "isolation", "lonely", "alone", "no friends"]):
+        signal_name = "isolation"
+
+    elif any(word in combined_text for word in ["stress", "stressed", "overwhelmed", "pressure", "anxiety", "anxious"]):
+        signal_name = "stress"
+
+    elif any(word in combined_text for word in ["bully", "bullied", "mocking", "harassment", "excluded"]):
+        signal_name = "bullying"
+
+    elif any(word in combined_text for word in ["abuse", "exploitation", "grooming", "unsafe at home"]):
+        signal_name = "abuse"
+
+    elif any(word in combined_text for word in ["extremism", "radical", "terrorism", "violence", "recruitment"]):
+        signal_name = "extremism"
+
+    elif any(word in combined_text for word in ["jailbreak", "prompt injection", "hack", "privacy", "cyber"]):
+        signal_name = "digital_safety"
+
+    if signal_name:
+        confidence = max(
+            float(review.get("single_message_risk", 0)),
+            float(review.get("conversation_chain_risk", 0))
+        ) / 4
+
+        log_human_signal_event(
+            company_id=company_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=latest_message_id,
+            signal_name=signal_name,
+            confidence=confidence,
+            trend_score=float(review.get("conversation_chain_risk", 0)) / 4,
+            raw_review=review,
+        )
+
+    print("HUMAN SIGNAL DEBUG:", {
+        "risk_type": review.get("risk_type"),
+        "reason": review.get("reason"),
+        "signal_name": signal_name,
+    })
+
+    classification = classify_human_signal(
+        latest_message=latest_message,
+        conversation_history=thread_text
+    )
+
+    print("HUMAN SIGNAL CLASSIFIER:", classification)
+
+    primary_signal = classification.get("primary_signal")
+
+    if primary_signal and primary_signal != "none":
+        log_human_signal_event(
+            company_id=company_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=latest_message_id,
+            signal_name=primary_signal,
+            confidence=float(classification.get("confidence", 0)),
+            trend_score=float(classification.get("severity", 0)) / 4,
+            source="human_signals_classifier",
+            raw_review=classification,
+        )
+
     return review
 
 def candidate_phrase_exists(phrase: str) -> bool:
@@ -745,13 +981,31 @@ def candidate_phrase_exists(phrase: str) -> bool:
 def save_candidate_patterns(candidates, conversation_id=None, message_id=None):
     """
     Saves possible new guardrail phrases suggested by the reviewer agent.
-    These are NOT made live automatically.
+    Supports both:
+    - list of strings
+    - list of dictionaries
     """
     if not candidates:
         return
 
     for c in candidates:
-        phrase = (c.get("phrase") or "").strip()
+
+        if isinstance(c, str):
+            phrase = c.strip()
+            category = "unknown"
+            language = "unknown"
+            suggested_severity = 1
+            reviewer_reason = ""
+
+        elif isinstance(c, dict):
+            phrase = (c.get("phrase") or "").strip()
+            category = c.get("category", "unknown")
+            language = c.get("language", "unknown")
+            suggested_severity = int(c.get("suggested_severity", 1) or 1)
+            reviewer_reason = c.get("reason", "")
+
+        else:
+            continue
 
         if not phrase:
             continue
@@ -761,12 +1015,12 @@ def save_candidate_patterns(candidates, conversation_id=None, message_id=None):
 
         secure_supabase.table("guardrail_candidate_patterns").insert({
             "phrase": phrase,
-            "category": c.get("category", "unknown"),
-            "language": c.get("language", "unknown"),
+            "category": category,
+            "language": language,
             "source_conversation_id": conversation_id,
             "source_message_id": message_id,
-            "suggested_severity": int(c.get("suggested_severity", 1) or 1),
-            "reviewer_reason": c.get("reason", ""),
+            "suggested_severity": suggested_severity,
+            "reviewer_reason": reviewer_reason,
             "status": "pending",
         }).execute()
 
@@ -1134,6 +1388,109 @@ def fetch_company_dashboard_analytics(days=30):
         usage_df["company_name"] = usage_df["company_id"].map(company_map)
 
     return login_df, usage_df
+
+def get_signal_id(signal_name: str):
+    try:
+        rows = (
+            secure_supabase
+            .table("signals_catalogue")
+            .select("id")
+            .eq("signal_name", signal_name)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+
+        return rows[0]["id"] if rows else None
+
+    except Exception as e:
+        print(f"Signal lookup failed: {e}")
+        return None
+
+
+def log_human_signal_event(
+    company_id=None,
+    user_id=None,
+    conversation_id=None,
+    message_id=None,
+    signal_name=None,
+    confidence=0,
+    trend_score=0,
+    source="conversation_risk_reviewer",
+    raw_review=None,
+):
+    try:
+        signal_id = get_signal_id(signal_name)
+
+        if not signal_id:
+            print(f"No signal found for: {signal_name}")
+            return
+
+        secure_supabase.table("human_signal_events").insert({
+            "company_id": company_id,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "signal_id": signal_id,
+            "confidence": confidence,
+            "trend_score": trend_score,
+            "source": source,
+            "raw_review": raw_review or {},
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+
+    except Exception as e:
+        print(f"Human signal event logging failed: {e}")
+
+def fetch_human_signals_admin(limit=500):
+    rows = (
+        secure_supabase
+        .table("human_signal_events")
+        .select("""
+            id,
+            company_id,
+            user_id,
+            conversation_id,
+            message_id,
+            confidence,
+            trend_score,
+            source,
+            raw_review,
+            created_at,
+            signals_catalogue (
+                signal_name,
+                description
+            )
+        """)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+    cleaned = []
+
+    for r in rows:
+        signal = r.get("signals_catalogue") or {}
+        raw = r.get("raw_review") or {}
+
+        cleaned.append({
+            "created_at": r.get("created_at"),
+            "signal": signal.get("signal_name"),
+            "confidence": r.get("confidence"),
+            "trend_score": r.get("trend_score"),
+            "decision": raw.get("decision") or raw.get("route"),
+            "trend": raw.get("trend"),
+            "risk_type": raw.get("risk_type") or raw.get("domain"),
+            "reason": raw.get("reason"),
+            "company_id": r.get("company_id"),
+            "user_id": r.get("user_id"),
+            "conversation_id": r.get("conversation_id"),
+            "message_id": r.get("message_id"),
+        })
+
+    return pd.DataFrame(cleaned)
 
 def fetch_guardrail_events_df(days=30):
     start_iso = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -2958,7 +3315,7 @@ def admin_page():
     st.title("🛠️ Admin Panel")
     st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Manage Agents",
     "Role Prompts",
     "Guardrails",
@@ -2966,6 +3323,7 @@ def admin_page():
     "Risk Intelligence",
     "Analytics Dashboard",
     "Usage & Cost",
+    "Human Signals",
     ])
 
     # --- TAB 1: Agent Description ---
@@ -3768,6 +4126,82 @@ def admin_page():
 
             st.dataframe(usage_df, use_container_width=True)
 
+  # --- TAB 8: Human Signals ---
+    with tab8:
+        st.subheader("🧠 Human Signals Dashboard")
+
+        signal_df = fetch_human_signals_admin(limit=500)
+
+        if signal_df.empty:
+            st.info("No human signals found.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric("Total Signals", len(signal_df))
+
+            avg_confidence = signal_df["confidence"].mean() if "confidence" in signal_df else 0
+            c2.metric("Avg Confidence", f"{avg_confidence:.2f}")
+
+            escalating = len(signal_df[signal_df["trend"] == "escalating"]) if "trend" in signal_df else 0
+            c3.metric("Escalating", escalating)
+
+            safety_notes = len(signal_df[signal_df["decision"] == "ADD_SAFETY_NOTE"]) if "decision" in signal_df else 0
+            c4.metric("Safety Notes", safety_notes)
+
+            st.markdown("---")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                signal_count = (
+                    signal_df.groupby("signal")
+                    .size()
+                    .reset_index(name="count")
+                )
+
+                fig = px.pie(
+                    signal_count,
+                    names="signal",
+                    values="count",
+                    title="Signals by Type"
+                )
+                st.plotly_chart(fig, use_container_width=True, key="human_signals_type_pie")
+
+            with col2:
+                trend_count = (
+                    signal_df.groupby("trend")
+                    .size()
+                    .reset_index(name="count")
+                )
+
+                fig = px.bar(
+                    trend_count,
+                    x="trend",
+                    y="count",
+                    title="Signals by Trend"
+                )
+                st.plotly_chart(fig, use_container_width=True, key="human_signals_trend_bar")
+
+            if "created_at" in signal_df:
+                signal_df["date"] = pd.to_datetime(signal_df["created_at"]).dt.date
+
+                daily_signals = (
+                    signal_df.groupby("date")
+                    .size()
+                    .reset_index(name="signals")
+                )
+
+                fig = px.line(
+                    daily_signals,
+                    x="date",
+                    y="signals",
+                    title="Human Signals Over Time"
+                )
+                st.plotly_chart(fig, use_container_width=True, key="human_signals_over_time")
+
+            st.markdown("### Signal Log")
+            st.dataframe(signal_df, use_container_width=True)
+
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
         admin_page()
@@ -4258,6 +4692,65 @@ if is_paid:
 
                             refined_q = refined_q + safety_note
 
+                        # >>> Human Signals Classifier response routing
+                        try:
+                            human_classification = classify_human_signal(
+                                latest_message=question,
+                                conversation_history=thread_text
+                            )
+                        except Exception as e:
+                            human_classification = {
+                                "route": "NORMAL",
+                                "primary_signal": "none",
+                                "reason": f"Classifier failed safely: {e}",
+                            }
+
+                        human_route = (human_classification.get("route") or "NORMAL").upper()
+
+                        if human_route in ["SOFT_SUPPORT", "ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
+                            support_reply = run_support_guidance_agent(
+                                question,
+                                human_classification
+                            )
+
+                            st.session_state["messages"].append({
+                                "role": "assistant",
+                                "content": support_reply
+                            })
+
+                            try:
+                                post_system_message(
+                                    free_conv_id,
+                                    f"[Support & Guidance] {support_reply}",
+                                    meta={
+                                        "human_signal_classification": human_classification,
+                                        "conversation_risk_review": risk_review,
+                                        "source": "support_guidance_agent"
+                                    }
+                                )
+                            except Exception as e:
+                                st.warning(f"Could not save Support & Guidance response: {e}")
+
+                            if human_route in ["ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
+                                try:
+                                    log_guardrail_event(
+                                        user_id=user["id"] if user else None,
+                                        question=question,
+                                        meta={
+                                            "human_signal_classification": human_classification,
+                                            "conversation_risk_review": risk_review,
+                                            "source": "support_guidance_agent",
+                                            "max_severity": human_classification.get("severity", 0),
+                                        },
+                                        conversation_id=free_conv_id,
+                                        message_id=free_user_msg.get("id"),
+                                        decision="ESCALATE_FOR_REVIEW",
+                                    )
+                                except Exception as e:
+                                    st.warning(f"Support escalation log failed: {e}")
+
+                            st.rerun()
+
                         if review_decision == "ESCALATE_FOR_REVIEW":
                             post_system_message(
                                 conv_id,
@@ -4553,38 +5046,96 @@ if not is_paid:
 
             question_with_context = question_with_context + safety_note
 
-        if review_decision == "ESCALATE_FOR_REVIEW":
+        # >>> Human Signals Classifier response routing
+        try:
+            human_classification = classify_human_signal(
+                latest_message=question,
+                conversation_history=thread_text
+            )
+        except Exception as e:
+            human_classification = {
+                "route": "NORMAL",
+                "primary_signal": "none",
+                "reason": f"Classifier failed safely: {e}",
+            }
+
+        human_route = (human_classification.get("route") or "NORMAL").upper()
+
+        if human_route in ["SOFT_SUPPORT", "ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
+            support_reply = run_support_guidance_agent(
+                question,
+                human_classification
+            )
+
             st.session_state["messages"].append({
                 "role": "assistant",
-                "content": "This conversation has been flagged for human safety review."
+                "content": support_reply
             })
 
             try:
-                post_system_message(
-                    free_conv_id,
-                    "This free-tier conversation has been flagged for human safety review.",
-                    meta={"conversation_risk_review": risk_review}
-                )
-            except Exception:
-                pass
-
-            try:
-                log_guardrail_event(
-                    user_id=user["id"] if user else None,
-                    question=question,
-                    meta={
+                secure_supabase.table("mvp_messages").insert({
+                    "conversation_id": free_conv_id,
+                    "author_id": None,
+                    "author_type": "agent",
+                    "content": support_reply,
+                    "meta": {
+                        "human_signal_classification": human_classification,
                         "conversation_risk_review": risk_review,
-                        "source": "free_tier",
-                        "max_severity": risk_review.get("conversation_chain_risk", 0),
+                        "source": "support_guidance_agent"
                     },
-                    conversation_id=free_conv_id,
-                    message_id=free_user_msg.get("id"),
-                    decision="ESCALATE_FOR_REVIEW",
-                )
+                    "created_at": datetime.utcnow().isoformat(),
+                }).execute()
             except Exception as e:
-                st.warning(f"Escalation log failed: {e}")
+                st.warning(f"Could not save Support & Guidance response: {e}")
+
+            if human_route in ["ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
+                try:
+                    log_guardrail_event(
+                        user_id=user["id"] if user else None,
+                        question=question,
+                        meta={
+                            "human_signal_classification": human_classification,
+                            "conversation_risk_review": risk_review,
+                            "source": "support_guidance_agent",
+                            "max_severity": human_classification.get("severity", 0),
+                        },
+                        conversation_id=free_conv_id,
+                        message_id=free_user_msg.get("id"),
+                        decision="DERAD_ONLY",
+                    )
+                except Exception as e:
+                    st.warning(f"Support escalation log failed: {e}")
 
             st.rerun()
+
+        if review_decision == "ESCALATE_FOR_REVIEW":
+            human_classification = classify_human_signal(
+                latest_message=question,
+                conversation_history=thread_text
+            )
+
+            support_reply = run_support_guidance_agent(
+                question,
+                human_classification
+            )
+
+            st.session_state["messages"].append({
+                "role": "assistant",
+                "content": support_reply
+            })
+
+            secure_supabase.table("mvp_messages").insert({
+                "conversation_id": free_conv_id,
+                "author_id": None,
+                "author_type": "assistant",
+                "content": support_reply,
+                "meta": {
+                    "human_signal_classification": human_classification,
+                    "conversation_risk_review": risk_review,
+                    "source": "support_guidance_agent"
+                },
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
 
         # ✅ From here onward, keep your existing pipeline, but use question_with_context instead of question 
         # Only public agents are allowed on the free home
@@ -4799,6 +5350,8 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
+
 
 
 
