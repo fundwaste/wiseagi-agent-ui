@@ -646,44 +646,58 @@ def run_support_guidance_agent(question, classification):
     route = classification.get("route", "SOFT_SUPPORT")
     signal = classification.get("primary_signal", "")
     reason = classification.get("reason", "")
+    memory_note = classification.get("memory_note", "")
 
     system_prompt = f"""
-You are the WiseAGI Support & Guidance Agent.
+    You are the WiseAGI Support & Guidance Agent.
 
-Route: {route}
-Primary Signal: {signal}
-Reason: {reason}
+    Route: {route}
+    Primary Signal: {signal}
+    Reason: {reason}
 
-You respond like a calm, caring support worker.
+    Previous memory:
+    {memory_note}
 
-Always follow this order:
-1. Acknowledge the emotion.
-2. Validate the feeling.
-3. Reassure the user they are not alone.
-4. Offer one practical safety step.
-5. Ask one or two gentle follow-up questions.
+    You respond like a calm, caring support worker.
 
-Important style rules:
-- Start with empathy, not explanation.
-- Do not sound like a teacher.
-- Do not sound like a policy document.
-- Do not give a long list immediately.
-- Speak directly to the user using "you".
-- Keep the first response short and human.
-- Tell the user they can continue talking to you here if that feels easier.
-- Do not mention guardrails, risk scores, classifiers, or human review.
+    Always follow this order:
+    1. Acknowledge the emotion.
+    2. Validate the feeling.
+    3. Reassure the user they are not alone.
+    4. Offer one practical safety step.
+    5. Ask one or two gentle follow-up questions.
 
-If the user may be in immediate danger:
-- Tell them their safety is the most important thing right now.
-- Suggest moving towards a busy public place, trusted adult, shop, neighbour, reception desk, teacher, manager, or local support point.
-- Encourage emergency help if they believe they are in immediate danger.
+    Important style rules:
+    - Do not repeat the same opening sentence in every reply.
+    - Respond to the newest detail the user has shared.
+    - Sound like a calm, caring person, not a scripted chatbot.
+    - Use natural, varied language.
+    - Keep the response short.
+    - Do not give a long list.
+    - Do not overuse phrases like "you are not alone".
+    - Do not keep repeating "talk to a trusted adult" in every message.
+    - If you already gave safety advice, build on it rather than repeating it.
+    - Ask one natural follow-up question.
+    - Show that you remember the conversation so far.
 
-For bullying, fear, pressure, abuse, coercion, grooming, or safeguarding:
-- Tell the user they do not deserve this.
-- Encourage trusted human support.
-- Ask: "Are you safe right now?"
-- Ask: "Is this happening today or has it happened before?"
-"""
+    If the user shares a new serious detail, respond directly to that detail.
+
+    Example:
+    User: "They want me to hurt people and I do not want to."
+    Better response:
+    "Thank you for telling me. The most important thing is that you do not want to hurt anyone, and that matters. You are being pressured, and that is not your fault. Let us focus on keeping you and your sister safe right now. Are you somewhere safe while we talk?"
+    
+    If the user may be in immediate danger:
+    - Tell them their safety is the most important thing right now.
+    - Suggest moving towards a busy public place, trusted adult, shop, neighbour, reception desk, teacher, manager, or local support point.
+    - Encourage emergency help if they believe they are in immediate danger.
+
+    For bullying, fear, pressure, abuse, coercion, grooming, or safeguarding:
+    - Tell the user they do not deserve this.
+    - Encourage trusted human support.
+    - Ask: "Are you safe right now?"
+    - Ask: "Is this happening today or has it happened before?"
+    """
 
     try:
         response = openai_client.chat.completions.create(
@@ -1025,6 +1039,76 @@ def save_candidate_patterns(candidates, conversation_id=None, message_id=None):
         }).execute()
 
 # ---------Memory helpers----------------------
+
+def update_user_memory_profile(
+    user_id,
+    company_id=None,
+    conversation_id=None,
+    message_id=None,
+    classification=None,
+    latest_message=None,
+):
+    if not user_id:
+        return
+
+    classification = classification or {}
+
+    signal = classification.get("primary_signal", "none")
+    route = classification.get("route", "NORMAL")
+    severity = int(classification.get("severity", 0) or 0)
+    confidence = float(classification.get("confidence", 0) or 0)
+
+    if signal == "none" or confidence < 0.5:
+        return
+
+    memory_summary = f"User recently discussed a concern linked to {signal}."
+    wellbeing_summary = classification.get("reason", "")
+    signal_summary = f"Signal: {signal}. Route: {route}. Severity: {severity}."
+
+    checkin_prompt = (
+        f"Last time we spoke, you mentioned something linked to {signal}. "
+        "How are things feeling today?"
+    )
+
+    payload = {
+        "user_id": user_id,
+        "company_id": company_id,
+        "memory_summary": memory_summary,
+        "wellbeing_summary": wellbeing_summary,
+        "signal_summary": signal_summary,
+        "last_signal": signal,
+        "last_route": route,
+        "last_severity": severity,
+        "last_conversation_id": conversation_id,
+        "last_message_id": message_id,
+        "checkin_prompt": checkin_prompt,
+        "confidence": confidence,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    secure_supabase.table("user_memory_profiles").upsert(
+        payload,
+        on_conflict="user_id,company_id"
+    ).execute()
+
+
+def fetch_user_memory_profile(user_id, company_id=None):
+    if not user_id:
+        return None
+
+    q = (
+        secure_supabase
+        .table("user_memory_profiles")
+        .select("*")
+        .eq("user_id", user_id)
+    )
+
+    if company_id:
+        q = q.eq("company_id", company_id)
+
+    rows = q.limit(1).execute().data or []
+    return rows[0] if rows else None
+
 def get_runtime_context() -> Dict[str, Any]:
     """
     Universal context for memory and prompt shaping.
@@ -1078,6 +1162,54 @@ def get_runtime_context() -> Dict[str, Any]:
         "external_user_id": learning_context.get("external_user_id"),
         "context_json": context_json,
     }
+
+def update_user_memory_profile(
+    user_id,
+    company_id=None,
+    conversation_id=None,
+    message_id=None,
+    classification=None,
+    latest_message=None,
+):
+    classification = classification or {}
+
+    signal = classification.get("primary_signal", "none")
+    route = classification.get("route", "NORMAL")
+    severity = int(classification.get("severity", 0) or 0)
+    confidence = float(classification.get("confidence", 0) or 0)
+
+    if signal == "none" or confidence < 0.5:
+        return
+
+    memory_summary = f"User recently discussed a concern linked to {signal}."
+    wellbeing_summary = classification.get("reason", "")
+    signal_summary = f"Signal: {signal}. Route: {route}. Severity: {severity}."
+
+    checkin_prompt = (
+        f"Last time we spoke, you mentioned something linked to {signal}. "
+        "How are things feeling today?"
+    )
+
+    payload = {
+        "user_id": user_id,
+        "company_id": company_id,
+        "memory_summary": memory_summary,
+        "wellbeing_summary": wellbeing_summary,
+        "signal_summary": signal_summary,
+        "last_signal": signal,
+        "last_route": route,
+        "last_severity": severity,
+        "last_conversation_id": conversation_id,
+        "last_message_id": message_id,
+        "checkin_prompt": checkin_prompt,
+        "confidence": confidence,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    secure_supabase.table("user_memory_profiles").upsert(
+        payload,
+        on_conflict="user_id,company_id"
+    ).execute()
 
 def get_memory_policy(company_id: Optional[str], plan_code: str = "free") -> Dict[str, Any]:
     """
@@ -4854,12 +4986,35 @@ if is_paid:
 
                         human_route = (human_classification.get("route") or "NORMAL").upper()
 
+                        try:
+                            update_user_memory_profile(
+                                user_id=user["id"] if user else None,
+                                company_id=user.get("company_id") if user else None,
+                                conversation_id=free_conv_id,
+                                message_id=free_user_msg.get("id"),
+                                classification=human_classification,
+                                latest_message=question,
+                            )
+                        except Exception as e:
+                            print(f"User memory update failed: {e}")
+
                         if human_route in ["SOFT_SUPPORT", "ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
+                            try:
+                                profile = fetch_user_memory_profile(
+                                    user["id"],
+                                    user.get("company_id")
+                                )
+
+                                if profile and profile.get("checkin_prompt"):
+                                    human_classification["memory_note"] = profile.get("checkin_prompt")
+
+                            except Exception as e:
+                                print(f"Could not fetch user memory profile: {e}")
+
                             support_reply = run_support_guidance_agent(
                                 question,
                                 human_classification
                             )
-
                             st.session_state["messages"].append({
                                 "role": "assistant",
                                 "content": support_reply
@@ -4895,6 +5050,9 @@ if is_paid:
                                     )
                                 except Exception as e:
                                     st.warning(f"Support escalation log failed: {e}")
+
+
+
 
                             st.rerun()
 
@@ -5235,6 +5393,21 @@ if not is_paid:
             except Exception as e:
                 st.warning(f"Could not save Support & Guidance response: {e}")
 
+            try:
+                supabase.table("qa_history").insert({
+                    "user_id": st.session_state["user"]["id"],
+                    "question": question,
+                    "answer": support_reply,
+                    "context": thread_text,
+                    "agent_list": "Support & Guidance Agent",
+                    "agent_roles": str({
+                        "Support & Guidance Agent": human_classification.get("primary_signal", "")
+                    }),
+                    "timestamp": datetime.utcnow().isoformat()
+                }).execute()
+            except Exception as e:
+                st.warning(f"Could not save Support & Guidance to previous questions: {e}")
+
             if human_route in ["ELEVATED_REVIEW", "CRITICAL_SAFETY"]:
                 try:
                     log_guardrail_event(
@@ -5497,6 +5670,7 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
+
 
 
 
