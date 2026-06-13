@@ -1,0 +1,29 @@
+Category Breakdown
+==================================================
+jailbreak_prompt_injection: 21817
+benign: 21356
+non_violent_unethical_behavior: 13775
+violence_aiding_and_abetting_incitement: 10431
+hate_speech_offensive_language: 10176
+child_abuse: 3539
+financial_crime_property_crime_theft: 3524
+self_harm: 3281
+discrimination_stereotype_injustice: 2941
+drug_abuse_weapons_banned_substance: 2378
+privacy_violation: 1836
+sexually_explicit_adult_content: 1452
+controversial_topics_politics: 982
+misinformation_regarding_ethics_laws_and_safety: 440
+malware_hacking_cyberattack: 395
+animal_abuse: 370
+cwe_compliance: 298
+terrorism_organized_crime: 296
+code_vulnerabilities: 293
+fraud_deception_misinformation: 227
+religious_bias: 57
+gender_bias: 54
+race_bias: 32
+orientation_bias: 27
+mitre_compliance: 23
+
+Total Categories: 25

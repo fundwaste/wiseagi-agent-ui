@@ -17,8 +17,12 @@ connections.connect(
     token="ce5060c7939d564fa7ae65d5c85cad6462b6b6fe5b0a8afc6216c7e3bd80da0aeb3ed4688157c2af9a36ddd30bc5838f9f53d880"
 )
 
+from dotenv import load_dotenv
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=api_key)
+
 model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-openai_client = OpenAI()
 
 # --------- 2. Helper Functions ---------
 def generate_embedding(text):
@@ -46,12 +50,11 @@ def query_openai_context(prompt, context, purpose="default"):
     model = model_router(purpose)
     full_input = f"{prompt}\n\n{context}"
 
-    # Count tokens in the prompt and context
     prompt_tokens = count_tokens(full_input, model)
 
     response = openai_client.chat.completions.create(
         model=model,
-        max_tokens=300,  # You can raise this if needed
+        max_tokens=300,
         messages=[
             {"role": "system", "content": "You are a helpful and knowledgeable assistant."},
             {"role": "user", "content": full_input}
@@ -63,10 +66,7 @@ def query_openai_context(prompt, context, purpose="default"):
     total_tokens = prompt_tokens + completion_tokens
     cost = estimate_cost(prompt_tokens, completion_tokens, model)
 
-    st.markdown(f"🧮 Tokens used: {total_tokens}")
-    st.markdown(f"💰 Estimated cost: ${cost:.4f}")
-
-    return answer
+    return answer, total_tokens, cost
 
 def deduplicate_agents(agent_list):
     seen = set()
@@ -77,6 +77,9 @@ def deduplicate_agents(agent_list):
             seen.add(agent['id'])
     return unique
 
+def get_company_agents(company_id):
+    return supabase.table("agents").select("*").eq("company_id", company_id).execute().data
+
 def get_all_agents():
     return supabase.table("agents").select("id, agent_name, description, collection_name").execute().data or []
 
@@ -86,6 +89,25 @@ def get_user_agents(user_id):
 
 def save_user_agent(user_id, agent_id):
     supabase.table("user_agents").insert({"user_id": user_id, "agent_id": agent_id}).execute()
+
+# ---- Leadership Profile Helpers ----
+def get_leadership_profile(user_id):
+    response = supabase.table("leadership_profiles").select("*").eq("user_id", user_id).execute()
+    return response.data[0] if response.data else None
+
+def save_leadership_profile(user_id, tone, description):
+    existing = get_leadership_profile(user_id)
+    if existing:
+        supabase.table("leadership_profiles").update({
+            "tone": tone,
+            "description": description
+        }).eq("user_id", user_id).execute()
+    else:
+        supabase.table("leadership_profiles").insert({
+            "user_id": user_id,
+            "tone": tone,
+            "description": description
+        }).execute()
 
 def upload_document_to_agent(file, agent_id):
     fname = f"{agent_id}/{file.name}"
@@ -136,9 +158,70 @@ if st.sidebar.button("🚪 Logout"):
     st.session_state.clear()
     st.rerun()
 
+# --------- Admin Panel Updated: Agent Role Prompts ---------
+
 def admin_page():
     st.title("🛠️ Admin Panel")
-    st.markdown("Welcome, Admin. You can manage collections and agents from this section.")
+    st.markdown("Manage agents, their descriptions, and role-based prompt templates.")
+
+    tab1, tab2 = st.tabs(["Manage Agents", "Role Prompts"])
+
+    # --- TAB 1: Agent Description ---
+    with tab1:
+        st.subheader("✍️ Edit Agent Descriptions")
+        agents = get_all_agents()
+        agent_dict = {a['agent_name']: a['id'] for a in agents}
+        selected_name = st.selectbox("Select Agent", list(agent_dict.keys()))
+        selected_id = agent_dict[selected_name]
+
+        # Fetch agent detail
+        agent_detail = supabase.table("agents").select("description").eq("id", selected_id).single().execute().data
+        desc = st.text_area("Agent Description", value=agent_detail.get("description", ""))
+
+        if st.button("Update Description"):
+            supabase.table("agents").update({"description": desc}).eq("id", selected_id).execute()
+            st.success("Agent description updated.")
+
+    # --- TAB 2: Role Prompts ---
+    with tab2:
+        st.subheader("🎭 Edit Role Prompts per Agent")
+
+        selected_name = st.selectbox("Select Agent for Roles", list(agent_dict.keys()), key="agent_roles")
+        selected_id = agent_dict[selected_name]
+
+        prompts = supabase.table("agent_role_prompts") \
+            .select("id, role, prompt_template, is_active") \
+            .eq("agent_id", selected_id).execute().data or []
+
+        st.markdown("### 📋 Existing Role Prompts")
+        if not prompts:
+            st.info("No prompts defined for this agent yet.")
+        for entry in prompts:
+            with st.expander(f"🧩 Role: {entry['role']}"):
+                new_template = st.text_area("Prompt Template", value=entry["prompt_template"], key=f"template_{entry['id']}")
+                new_status = st.checkbox("Active", value=entry["is_active"], key=f"active_{entry['id']}")
+                if st.button("Save", key=f"save_{entry['id']}"):
+                    supabase.table("agent_role_prompts") \
+                        .update({"prompt_template": new_template, "is_active": new_status}) \
+                        .eq("id", entry["id"]).execute()
+                    st.success("Prompt updated.")
+
+        st.markdown("---")
+        st.subheader("➕ Add New Role Prompt")
+        role_name = st.text_input("Role Name")
+        prompt_text = st.text_area("Prompt Template")
+        if st.button("Add Prompt"):
+            if role_name and prompt_text:
+                supabase.table("agent_role_prompts").insert({
+                    "agent_id": selected_id,
+                    "role": role_name,
+                    "prompt_template": prompt_text,
+                    "is_active": True
+                }).execute()
+                st.success("Prompt added.")
+                st.rerun()
+            else:
+                st.warning("Both fields are required.")
 
 if st.session_state.get("user", {}).get("is_admin", False):
     if st.sidebar.checkbox("🔐 Admin Mode"):
@@ -197,6 +280,28 @@ with st.sidebar.form("new_agent_form", clear_on_submit=True):
             else:
                 st.sidebar.error("⚠️ Could not create agent.")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧭 Leadership Personality")
+
+# Get authenticated user's ID from Supabase Auth
+user = supabase.auth.get_user()
+user_id = user.user.id if user else None
+
+if not user_id:
+    st.sidebar.error("⚠️ You must be signed in to edit your leadership profile.")
+    st.stop()
+
+profile = get_leadership_profile(user_id)
+default_tone = profile["tone"] if profile else ""
+default_desc = profile["description"] if profile else ""
+
+with st.sidebar.form("leadership_profile_form"):
+    tone = st.selectbox("Leadership Tone", ["Strategic", "Analytical", "Collaborative", "Visionary", "Challenger"], index=0 if not default_tone else ["Strategic", "Analytical", "Collaborative", "Visionary", "Challenger"].index(default_tone))
+    desc = st.text_area("How do you approach decision-making?", value=default_desc)
+    submitted = st.form_submit_button("💾 Save Leadership Profile")
+    if submitted:
+        save_leadership_profile(user_id, tone, desc)
+        st.success("Leadership profile updated.")
 
 # --------- 7. Ask Question with Role-Aware Collaboration ---------
 st.title("WiseAGI - Your Personal Collaborative Experts")
@@ -209,7 +314,7 @@ def create_role_based_prompt(agent_role, default_summary, agent_speciality, sour
         return f"{agent_speciality}: Summarise this question with supporting details:\n{default_summary}{citation}"
     elif agent_role == "devil_advocate":
         return (
-            f"{agent_speciality} (Devil's Advocate): Critically review the summary, identify gaps, question assumptions:\n{default_summary}{citation}"
+            f"{agent_speciality} (Devil's Advocate): Provide a counterargument or challenge the reasoning presented. Offer a contrasting perspective using evidence from the provided sources."
         )
     elif agent_role == "pragmatic":
         return (
@@ -229,7 +334,10 @@ if selected_agent_ids and st.button("Submit Question"):
     agent_scores = []
     results_by_agent = {}
     col = Collection("wise_studies")
-
+    
+    total_tokens = 0
+    total_cost = 0.0
+    
     for agent in user_agents:
         if agent['id'] in selected_agent_ids:
             results = col.search(
@@ -237,7 +345,7 @@ if selected_agent_ids and st.button("Submit Question"):
                 anns_field="vector",
                 param={"metric_type": "COSINE", "params": {"nprobe": 5}},
                 limit=3,
-                output_fields=["Text", "agent_id", "document_title", "Source"]
+                output_fields=["Text", "agent_id", "Source"]
             )
             filtered = [r for r in results[0] if r.entity.get("agent_id") == agent['id']]
             score = filtered[0].distance if filtered else 0.0
@@ -252,38 +360,56 @@ if selected_agent_ids and st.button("Submit Question"):
 
     default_agent = agent_scores[0][0]
     default_hits = results_by_agent.get(default_agent['id'], [])
-    default_titles = set(hit.get("document_title") or "" for hit in default_hits)
+    default_titles = set(hit.get("source") or "" for hit in default_hits)
     default_sources = ", ".join(sorted(default_titles))
     default_prompt = create_role_based_prompt("default", question, default_agent["description"], default_sources)
-    default_summary = query_openai_context(question, default_prompt)
+    default_summary, tokens_used, cost = query_openai_context(question, default_prompt)
+    total_tokens += tokens_used
+    total_cost += cost
+
     role_results[default_agent["agent_name"]] = default_summary
     assigned_roles[default_agent["agent_name"]] = "default"
     cited_docs[default_agent["agent_name"]] = default_sources
 
+    st.markdown(f"**[{default_agent['agent_name']}] Role: Default**")
+    st.markdown(f"*Sources: {default_sources}*")
+    st.write(default_summary)
+    st.markdown(f"🧮 Tokens used: {tokens_used}")
+    st.markdown(f"💰 Estimated cost: ${cost:.4f}")
+
     for i, (agent, _) in enumerate(agent_scores[1:], start=1):
         role = role_order[i] if i < len(role_order) else "supportive"
         hits = results_by_agent.get(agent['id'], [])
-        sources = ", ".join(sorted(set(hit.entity.get("document_title", "") for hit in hits)))
-        prompt = create_role_based_prompt(role, default_summary, agent["description"], sources)
-        agent_summary = query_openai_context(f"Agent [{agent['agent_name']}] role: {role}", prompt, purpose="peer_review")
+        sources = ", ".join(sorted(set(hit.entity.get("Source", "") for hit in hits)))
+        prompt = create_role_based_prompt(role, f"Question: {question}\nSummary: {default_summary}", agent["description"], sources)
+        agent_summary, tokens_used, cost = query_openai_context(f"Agent [{agent['agent_name']}] role: {role}", prompt, purpose="peer_review")
+        total_tokens += tokens_used
+        total_cost += cost
+
         role_results[agent["agent_name"]] = agent_summary
         assigned_roles[agent["agent_name"]] = role
         cited_docs[agent["agent_name"]] = sources
 
+        st.markdown(f"**[{agent['agent_name']}] Role: {role.replace('_', ' ').title()}**")
+        st.markdown(f"*Sources: {sources}*")
+        st.write(agent_summary)
+        st.markdown(f"🧮 Tokens used: {tokens_used}")
+        st.markdown(f"💰 Estimated cost: ${cost:.4f}")
+
     combined_context = "\n\n".join([f"[{name}] {summary}" for name, summary in role_results.items()])
     final_sources = ", ".join(sorted(set(sum([v.split(", ") for v in cited_docs.values()], []))))
     final_prompt = f"Final consensus answer based on all perspectives. Cite from: {final_sources}"
-    final_answer = query_openai_context(final_prompt, combined_context, purpose="consensus")
+    final_answer, tokens_used, cost = query_openai_context(final_prompt, combined_context, purpose="consensus")
+    total_tokens += tokens_used
+    total_cost += cost
 
     st.success("🧠 Final AI Response:")
     st.write(final_answer)
+    st.markdown(f"🧮 Tokens used for final AI response: {tokens_used}")
+    st.markdown(f"💰 Estimated cost: ${cost:.4f}")
 
-    for name, summary in role_results.items():
-        role = assigned_roles.get(name, "supportive").replace("_", " ").title()
-        docs = cited_docs.get(name, "")
-        st.markdown(f"**[{name}] Role: {role}**")
-        st.markdown(f"*Sources: {docs}*")
-        st.write(summary)
+    st.markdown("### 🧾 Summary")
+    st.markdown(f"📝 To answer this question with all the agents you used {total_tokens} tokens and the total cost was ${total_cost:.4f}.")
 
     supabase.table("qa_history").insert({
         "user_id": st.session_state['user']['id'],
