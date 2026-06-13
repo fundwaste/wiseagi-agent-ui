@@ -1299,6 +1299,80 @@ def get_company_admins(company_id):
         and r["Users"].get("company_id") == company_id
     ]
 
+def get_agent_documents(agent_id):
+
+    # New document registry table
+    registry_docs = (
+        secure_supabase
+        .table("agent_documents")
+        .select("*")
+        .eq("agent_id", agent_id)
+        .execute()
+        .data or []
+    )
+
+    # Older embedded documents table
+    old_docs = (
+        secure_supabase
+        .table("documents")
+        .select("*")
+        .eq("agent_id", agent_id)
+        .execute()
+        .data or []
+    )
+
+    normalised_old_docs = []
+
+    for doc in old_docs:
+        normalised_old_docs.append({
+            "document_title": doc.get("file_name"),
+            "file_name": doc.get("file_name"),
+            "author": None,
+            "publish_date": None,
+            "language": "Unknown",
+            "collection_name": "Unknown",
+            "chunk_count": None,
+            "source": "Legacy embedded document",
+            "status": "active",
+            "uploaded_at": doc.get("date_embedded"),
+            "created_at": doc.get("date_embedded"),
+        })
+
+    return registry_docs + normalised_old_docs
+def get_visible_agents_for_documents():
+    return get_visible_agents(
+        active_only=False,
+        include_private=True
+    )
+
+
+def save_agent_document_record(
+    agent_id,
+    company_id,
+    document_title,
+    author,
+    publish_date,
+    language,
+    collection_name,
+    uploaded_by,
+    chunk_count,
+    source,
+    status
+):
+    secure_supabase.table("agent_documents").insert({
+        "agent_id": agent_id,
+        "company_id": company_id,
+        "document_title": document_title,
+        "author": author,
+        "publish_date": publish_date,
+        "language": language,
+        "collection_name": collection_name,
+        "uploaded_by": uploaded_by,
+        "chunk_count": chunk_count,
+        "source": source,
+        "status": status
+    }).execute()
+
 def get_current_company_id():
     user = st.session_state.get("user") or {}
     return user.get("company_id")
@@ -3548,6 +3622,39 @@ def get_user_agents(user_id):
     join = supabase.table("user_agents").select("agent_id, agents(id, agent_name, description, collection_name)").eq("user_id", user_id).execute()
     return deduplicate_agents([r["agents"] for r in join.data if r.get("agents")])
 
+def get_visible_agents(active_only=True, include_private=True):
+    user = st.session_state.get("user") or {}
+    company_id = user.get("company_id")
+
+    query = (
+        secure_supabase
+        .table("agents")
+        .select("*")
+        .order("agent_name")
+    )
+
+    if active_only:
+        query = query.eq("is_active", True)
+
+    agents = query.execute().data or []
+
+    if is_super_admin():
+        return agents
+
+    visible_agents = []
+
+    for agent in agents:
+        is_public = agent.get("is_public") is True
+        agent_company_id = agent.get("company_id")
+
+        if is_public:
+            visible_agents.append(agent)
+
+        elif include_private and agent_company_id == company_id:
+            visible_agents.append(agent)
+
+    return visible_agents
+
 def load_user_personality(user_id: str, company_id: str):
     try:
         res = supabase.table("user_personalities") \
@@ -4032,6 +4139,9 @@ def admin_page():
     if has_permission("manage_agents"):
         tab_names.append("Manage Agents")
 
+    if has_permission("manage_agents"):
+        tab_names.append("Agent Documents")    
+
     if has_permission("manage_roles"):
         tab_names.append("Role Prompts")
 
@@ -4401,7 +4511,10 @@ def admin_page():
             st.subheader("✍️ Edit Agent Descriptions")
 
             # Admin must see all agents, including disabled ones
-            agents = get_all_agents(active_only=False)
+            agents = get_visible_agents(
+                active_only=False,
+                include_private=True
+            )
 
             if not agents:
                 st.info("No agents found.")
@@ -4462,6 +4575,211 @@ def admin_page():
 
                 st.success("Agent updated successfully.")
                 st.rerun()
+
+# -------- Agent Documents ---------
+    if "Agent Documents" in tabs:
+
+        with tabs["Agent Documents"]:
+
+            st.subheader("📚 Agent Documents")
+
+            st.write(
+                "View and register documents held by each agent, including language and collection."
+            )
+
+            agents = get_visible_agents_for_documents()
+
+            if not agents:
+                st.info("No agents available.")
+                st.stop()
+
+            agent_options = {
+                f"{a['agent_name']} | {'🌍 Public' if a.get('is_public') else '🔒 Private'} | {'✅ Enabled' if a.get('is_active', True) else '🚫 Disabled'}":
+                a
+                for a in agents
+            }
+
+            selected_agent_label = st.selectbox(
+                "Select Agent",
+                list(agent_options.keys()),
+                key="agent_documents_select_agent"
+            )
+
+            selected_agent = agent_options[selected_agent_label]
+
+            st.markdown("### Document Register")
+
+            docs = get_agent_documents(selected_agent["id"])
+
+            if docs:
+
+                docs_df = pd.DataFrame(docs)
+
+                # Use file_name as fallback if document_title is missing
+                if "document_title" in docs_df.columns and "file_name" in docs_df.columns:
+                    docs_df["document_title"] = docs_df["document_title"].fillna(
+                        docs_df["file_name"]
+                    )
+
+                # Fill missing values
+                if "language" in docs_df.columns:
+                    docs_df["language"] = docs_df["language"].fillna("Unknown")
+
+                if "collection_name" in docs_df.columns:
+                    docs_df["collection_name"] = docs_df["collection_name"].fillna("Unknown")
+
+                # Search filter
+                search_text = st.text_input(
+                    "Search documents",
+                    key="agent_document_search"
+                )
+
+                if search_text:
+                    docs_df = docs_df[
+                        docs_df["document_title"]
+                        .astype(str)
+                        .str.contains(search_text, case=False, na=False)
+                    ]
+
+                # Summary cards
+                c1, c2, c3 = st.columns(3)
+
+                with c1:
+                    st.metric("Documents", len(docs_df))
+
+                with c2:
+                    st.metric(
+                        "Languages",
+                        docs_df["language"].nunique() if "language" in docs_df.columns else 1
+                    )
+
+                with c3:
+                    st.metric(
+                        "Collections",
+                        docs_df["collection_name"].nunique() if "collection_name" in docs_df.columns else 1
+                    )
+
+                # Rename for display
+                display_df = docs_df.rename(
+                    columns={
+                        "document_title": "Document",
+                        "language": "Language",
+                        "collection_name": "Collection",
+                        "uploaded_at": "Embedded",
+                        "created_at": "Created"
+                    }
+                )
+
+                visible_columns = [
+                    "Document",
+                    "Language",
+                    "Collection",
+                    "Embedded"
+                ]
+
+                existing_columns = [
+                    col for col in visible_columns
+                    if col in display_df.columns
+                ]
+
+                st.dataframe(
+                    display_df[existing_columns],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                if "chunk_count" in docs_df.columns:
+                    st.metric(
+                        "Total chunks",
+                        int(docs_df["chunk_count"].fillna(0).sum())
+                    )
+
+            else:
+                st.info("No documents registered for this agent yet.")
+            # st.markdown("---")
+            # st.markdown("### Add Document Record")
+
+            # st.warning(
+            #     "This records document metadata only. It does not yet upload or embed the document."
+            # )
+
+            # document_title = st.text_input(
+            #     "Document title",
+            #     key="doc_title_input"
+            # )
+
+            # author = st.text_input(
+            #     "Author",
+            #     key="doc_author_input"
+            # )
+
+            # publish_date = st.date_input(
+            #     "Publish date",
+            #     value=None,
+            #     key="doc_publish_date_input"
+            # )
+
+            # language = st.selectbox(
+            #     "Language",
+            #     ["English", "Arabic", "French", "Swahili", "Urdu", "Turkish", "Other"],
+            #     key="doc_language_select"
+            # )
+
+            # collection_name = st.selectbox(
+            #     "Collection",
+            #     [
+            #         "all_agents",
+            #         "all_agents_arabic",
+            #         "future_french_collection",
+            #         "future_swahili_collection",
+            #         "future_urdu_collection",
+            #         "other"
+            #     ],
+            #     key="doc_collection_select"
+            # )
+
+            # chunk_count = st.number_input(
+            #     "Chunk count",
+            #     min_value=0,
+            #     value=0,
+            #     step=1,
+            #     key="doc_chunk_count_input"
+            # )
+
+            # source = st.text_input(
+            #     "Source",
+            #     key="doc_source_input"
+            # )
+
+            # status = st.selectbox(
+            #     "Status",
+            #     ["active", "archived", "draft", "needs_review"],
+            #     key="doc_status_select"
+            # )
+
+            # if st.button("Save Document Record", key="save_agent_document_record"):
+
+            #     if not document_title.strip():
+            #         st.warning("Please enter a document title.")
+            #     else:
+            #         current_user = st.session_state.get("user") or {}
+
+            #         save_agent_document_record(
+            #             agent_id=selected_agent["id"],
+            #             company_id=selected_agent.get("company_id") or current_user.get("company_id"),
+            #             document_title=document_title.strip(),
+            #             author=author.strip(),
+            #             publish_date=str(publish_date) if publish_date else None,
+            #             language=language,
+            #             collection_name=collection_name,
+            #             uploaded_by=current_user.get("id"),
+            #             chunk_count=int(chunk_count),
+            #             source=source.strip(),
+            #             status=status
+            #         )
+
+            #         st.success("Document record saved.")
+            #         st.rerun()
 
     # --- TAB 2: Role Prompts ---
 
@@ -5663,7 +5981,15 @@ if show_dev:
                 st.success("Plan set to Enterprise."); st.rerun()
 
     # Optional: simple public-agent picker for Free users
-    pubs = supabase.table("agents").select("id,agent_name,description").eq("is_public", True).execute().data or []
+    pubs = (
+        secure_supabase
+        .table("agents")
+        .select("id,agent_name,description")
+        .eq("is_public", True)
+        .eq("is_active", True)
+        .execute()
+        .data or []
+    )
     st.sidebar.header("Public agents")
     free_selected = []
     for a in pubs:
@@ -5710,13 +6036,22 @@ if is_paid:
     st.sidebar.markdown("---")
     st.sidebar.header("Your Current Agents")
 
-    render_agent_admin_panel(supabase, project_id, user["id"], get_all_agents())
+    render_agent_admin_panel(
+        supabase,
+        project_id,
+        user["id"],
+        get_visible_agents(active_only=True, include_private=True)
+    )
     chosen_agents = render_agent_picker(supabase, project_id, get_user_agents(user["id"]))
     selected_agent_ids = [a["id"] for a in chosen_agents]
 
     st.sidebar.markdown("---")
     st.sidebar.header("Add New Agents")
-    existing_agents = get_all_agents()
+    existing_agents = get_visible_agents(
+        active_only=True,
+        include_private=True
+    )
+    
     query = st.sidebar.text_input("Search for agent expertise:")
     filtered = [a for a in existing_agents if query.lower() in a['description'].lower()] if query else existing_agents
     available = {f"{a['agent_name']} - {a['description']}": a['id'] for a in filtered if a['id'] not in selected_agent_ids}
@@ -5738,13 +6073,16 @@ if is_paid:
             if not new_name or not new_desc:
                 st.warning("Please provide both an agent name and description.")
             else:
-                res = supabase.table("agents").insert({
+                res = secure_supabase.table("agents").insert({
                     "agent_name": new_name,
                     "description": new_desc,
-                    "user_id": st.session_state['user']['id'],
+                    "user_id": st.session_state["user"]["id"],
+                    "company_id": st.session_state["user"].get("company_id"),
                     "collection_name": new_name.replace(" ", "_").lower(),
-                    "is_public": True
+                    "is_public": False,
+                    "is_active": True
                 }).execute()
+
                 if res.data:
                     agent_id = res.data[0]['id']
                     for f in uploaded_files or []:
@@ -6756,7 +7094,6 @@ if 'loaded_question' in st.session_state:
     st.code(st.session_state.get('loaded_roles', '{}'))
     st.subheader("🔮 Previous Answer")
     st.write(st.session_state['loaded_answer'])
-
 
 
 
